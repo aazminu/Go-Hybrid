@@ -17,9 +17,10 @@ fn error_codes(res: &CheckResult) -> Vec<String> {
 fn assert_rejects_e6002(src: &str, label: &str) {
     let r = check(src);
     let codes = error_codes(&r);
-    assert!(
-        codes.iter().any(|c| c == "HYB-E6002"),
-        "expected HYB-E6002 for {label}, got {codes:?} (diags: {:?})",
+    assert_eq!(
+        codes,
+        vec!["HYB-E6002".to_string()],
+        "expected exactly one HYB-E6002 for {label}, got {codes:?} (diags: {:?})",
         r.diagnostics
     );
 }
@@ -69,6 +70,14 @@ fn issue_725_typed_const_operator_table_rejects_all() {
         ("u8(200) * 2", "fn main() {\n    x := u8(200) * 2\n    _ = x\n}\n"),
         ("u8(1) << 9", "fn main() {\n    x := u8(1) << 9\n    _ = x\n}\n"),
         (
+            "u8(1) << u32(8)",
+            "fn main() {\n    x := u8(1) << u32(8)\n    _ = x\n}\n",
+        ),
+        (
+            "1 << u32(63)",
+            "fn main() {\n    x := 1 << u32(63)\n    _ = x\n}\n",
+        ),
+        (
             "i8(127) + i8(1)",
             "fn main() {\n    x := i8(127) + i8(1)\n    _ = x\n}\n",
         ),
@@ -93,12 +102,40 @@ fn issue_725_typed_const_operator_table_rejects_all() {
             "fn main() {\n    var b u8 = u8(255) + 1\n    _ = b\n}\n",
         ),
         (
+            "assignment x = u8(255) + 1",
+            "fn main() {\n    var x u8 = 0\n    x = u8(255) + 1\n    _ = x\n}\n",
+        ),
+        (
+            "parenthesized var b u8 = (u8(255) + 1)",
+            "fn main() {\n    var b u8 = (u8(255) + 1)\n    _ = b\n}\n",
+        ),
+        (
+            "file-level const b u8 = u8(255) + 1",
+            "const b u8 = u8(255) + 1\nfn main() {\n    _ = b\n}\n",
+        ),
+        (
+            "parenthesized file-level const b u8 = (u8(255) + 1)",
+            "const b u8 = (u8(255) + 1)\nfn main() {\n    _ = b\n}\n",
+        ),
+        (
             "local const top u8 = 255; top + 1",
             "fn main() {\n    const top u8 = 255\n    x := top + 1\n    _ = x\n}\n",
         ),
         (
             "untyped const from conversion: const top = u8(255); top + 1",
             "const top = u8(255)\nfn main() {\n    x := top + 1\n    _ = x\n}\n",
+        ),
+        (
+            "chained untyped const does not cascade HYB-E6002",
+            "const a = u8(255)\nconst b = a + 1\nfn main() {\n    x := b + 1\n    _ = x\n}\n",
+        ),
+        (
+            "chained local untyped const does not cascade HYB-E6002",
+            "fn main() {\n    const a = u8(255)\n    const b = a + 1\n    x := b + 1\n    _ = x\n}\n",
+        ),
+        (
+            "local const referencing file const before local variable shadowing",
+            "const top u8 = 255\nfn main() {\n    const c = top\n    top := 1\n    _ = top\n    x := c + 1\n    _ = x\n}\n",
         ),
         (
             "-i8(-128)",

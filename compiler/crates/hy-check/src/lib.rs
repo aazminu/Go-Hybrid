@@ -286,12 +286,12 @@ fn build_tables(ck: &mut Checker<'_>) {
     for d in &file.decls {
         match d {
             Decl::Const(c) => {
+                ck.check_expr_emit_guard(&FnState::default(), &c.value);
                 if let Some(ty) = &c.ty {
                     ck.check_type_expr(ty);
                     ck.check_local_array_lit_len_match(ty, &c.value);
                     ck.check_const_overflow_init(&c.name, ty, &c.value, None);
                 }
-                ck.check_expr_emit_guard(&FnState::default(), &c.value);
                 ck.check_composite_nils(&FnState::default(), &c.value);
                 ck.check_expr_builtin_args(&c.value);
                 let b = ck.const_binding(c);

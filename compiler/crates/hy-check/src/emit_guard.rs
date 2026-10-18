@@ -18,10 +18,7 @@
 //! walk stays shallow (`deep = false`) and closure bodies are recursed
 //! exactly once via `Expr::FnLit`.
 
-use crate::const_overflow::{
-    const_float_value, const_int_fold_with, const_int_value, fixed_width_int_range, fold_bin,
-    parse_int_lit, ConstFold, ConstInt,
-};
+use crate::const_overflow::{const_float_value, const_int_value, parse_int_lit, ConstInt};
 use crate::model::{as_addr_of, unwrap_parens, Checker, FnState, TypeShape};
 use hy_diag::{Diagnostic, Span};
 use hy_syntax::{

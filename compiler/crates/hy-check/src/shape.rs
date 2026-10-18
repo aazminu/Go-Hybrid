@@ -339,7 +339,9 @@ impl<'a> Checker<'a> {
                         .unwrap_or(TypeShape::Unknown),
                     "len" | "cap" | "min" | "max" | "int" | "int8" | "int16" | "int32"
                     | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr"
-                    | "float32" | "float64" | "bool" | "byte" | "rune" => TypeShape::Primitive,
+                    | "float32" | "float64" | "bool" | "byte" | "rune"
+                    | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                    | "isize" | "usize" | "f32" | "f64" => TypeShape::Primitive,
                     "string" => TypeShape::Str,
                     // `new(T)` is Go's `new`: it returns `*T` — a POINTER to
                     // zeroed, mutable storage — never a primitive copy. Typing
@@ -389,7 +391,16 @@ impl<'a> Checker<'a> {
                             .or_else(|| self.fns.get(head))
                             .and_then(|f| f.results.first())
                             .map(|r| self.shape_of_type(&r.ty))
-                            .unwrap_or(TypeShape::Unknown)
+                            .unwrap_or_else(|| {
+                                if args.len() == 1
+                                    && !args[0].spread
+                                    && self.type_aliases.contains_key(head)
+                                {
+                                    self.named_shape(head)
+                                } else {
+                                    TypeShape::Unknown
+                                }
+                            })
                     }
                 }
             }

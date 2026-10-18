@@ -30,11 +30,10 @@ impl<'a> Checker<'a> {
         st: Option<&FnState>,
     ) {
         let val_span = value.span();
-        if self
-            .diags
-            .iter()
-            .any(|d| d.code == "HYB-E6002" && d.span == val_span)
-        {
+        if self.diags.iter().any(|d| {
+            (d.code == "HYB-E6002" || d.code == "HYB-E6005" || d.code == "HYB-E6006")
+                && (d.span == val_span || span_contains_pos(val_span, d.span.start))
+        }) {
             return;
         }
         let resolved = self.resolve_type_alias(ty);
@@ -190,6 +189,13 @@ impl<'a> Checker<'a> {
         value: &Expr,
         st: Option<&FnState>,
     ) {
+        let val_span = value.span();
+        if self.diags.iter().any(|d| {
+            (d.code == "HYB-E6002" || d.code == "HYB-E6005" || d.code == "HYB-E6006")
+                && (d.span == val_span || span_contains_pos(val_span, d.span.start))
+        }) {
+            return;
+        }
         let resolved = self.resolve_type_alias(ty);
         let TypeExpr::Named {
             name: ty_name,
@@ -427,8 +433,11 @@ impl<'a> Checker<'a> {
                 if let Some((decl_ty, init_val, _)) =
                     self.resolve_local_const_decl_at(name, span.start)
                 {
-                    let folded = self.const_int_fold_expr_depth(init_val, depth + 1, st);
-                    if let Some(ty) = decl_ty {
+                    let folded = self.const_int_fold_expr_depth(init_val, depth + 1, None);
+                    let eff_ty = decl_ty
+                        .clone()
+                        .or_else(|| self.typed_const_expr_type(None, init_val, depth + 1));
+                    if let Some(ty) = &eff_ty {
                         let resolved = self.resolve_type_alias(ty);
                         if let TypeExpr::Named { name: tname, .. } = &resolved {
                             if let Some((lo, hi)) = fixed_width_int_range(tname) {
@@ -451,7 +460,11 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }) {
                     let folded = self.const_int_fold_expr_depth(&c.value, depth + 1, None);
-                    if let Some(ty) = &c.ty {
+                    let eff_ty = c
+                        .ty
+                        .clone()
+                        .or_else(|| self.typed_const_expr_type(None, &c.value, depth + 1));
+                    if let Some(ty) = &eff_ty {
                         let resolved = self.resolve_type_alias(ty);
                         if let TypeExpr::Named { name: tname, .. } = &resolved {
                             if let Some((lo, hi)) = fixed_width_int_range(tname) {
@@ -540,7 +553,7 @@ impl<'a> Checker<'a> {
         if depth > 16 {
             return None;
         }
-        if matches!(self.const_int_fold_expr_depth(expr, 0, st), ConstFold::NotConst) {
+        if matches!(self.const_int_fold_expr_depth(expr, depth, st), ConstFold::NotConst) {
             return None;
         }
         match unwrap_parens(expr) {
@@ -556,7 +569,7 @@ impl<'a> Checker<'a> {
                         }
                         return None;
                     }
-                    return self.typed_const_expr_type(st, init_val, depth + 1);
+                    return self.typed_const_expr_type(None, init_val, depth + 1);
                 }
                 if st.is_some_and(|s| s.env_lookup(name).is_some()) {
                     return None;
@@ -1310,6 +1323,11 @@ fn is_float_type(ty_name: &str) -> Option<bool> {
 
 fn span_hint(span: Span) -> String {
     format!("{}:{}", span.start.line, span.start.col)
+}
+
+fn span_contains_pos(s: Span, pos: hy_diag::Pos) -> bool {
+    (s.start.line, s.start.col) <= (pos.line, pos.col)
+        && (pos.line, pos.col) <= (s.end.line, s.end.col)
 }
 
 /// Target word size for platform-dependent integer types. Hybrid's current
