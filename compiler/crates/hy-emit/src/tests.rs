@@ -2529,3 +2529,25 @@ fn parenthesized_slot_loan_lowers_to_copy_and_storeback() {
         go
     );
 }
+
+#[test]
+fn trailing_dot_float_emits_separate_statements() {
+    let go = emit(
+        "package main\n\nimport \"fmt\"\n\nfn main() {\n    var scale f64 = 2.\n    x := 2. + 1.0\n    fmt.println(scale, x)\n}\n",
+    );
+    assert!(
+        go.contains("var scale float64 = 2.\n"),
+        "expected `var scale float64 = 2.` on its own line, got:\n{}",
+        go
+    );
+    assert!(
+        go.contains("x := 2. + 1.0\n"),
+        "expected `x := 2. + 1.0`, got:\n{}",
+        go
+    );
+    assert!(
+        !go.contains("2.fmt"),
+        "must not fold next line into `2.fmt`:\n{}",
+        go
+    );
+}

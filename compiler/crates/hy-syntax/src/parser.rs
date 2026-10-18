@@ -2028,7 +2028,7 @@ impl Parser {
                 }
             }
             match self.cur() {
-                Tok::Punct(".") => {
+                Tok::Punct(".") if self.same_line_as_prev() => {
                     self.bump();
                     let name = self.expect_ident()?;
                     let span = self.span_to_prev(e.span().start);
@@ -3930,4 +3930,42 @@ fn main() {
         );
     }
 
+    #[test]
+    fn trailing_dot_float_does_not_fold_next_line() {
+        // Issue #659: `var scale f64 = 2.` followed by `fmt.println(scale)` on
+        // the next line must parse as two distinct statements, not fold the
+        // next line into `2.fmt.println(scale)`.
+        let f = parse_src(
+            "package main\n\nimport \"fmt\"\n\nfn main() {\n    var scale f64 = 2.\n    fmt.println(scale)\n    fmt.println(scale * 3.0)\n}\n",
+        );
+        let body = f.fns().next().unwrap().body.as_ref().unwrap();
+        assert_eq!(
+            body.stmts.len(),
+            3,
+            "expected three statements in main, got {:?}",
+            body.stmts
+        );
+        let Stmt::Local(LocalDecl { values, .. }) = &body.stmts[0] else {
+            panic!("expected LocalDecl, got {:?}", body.stmts[0]);
+        };
+        assert!(matches!(
+            values.as_slice(),
+            [Expr::Lit {
+                kind: LitKind::Float(s),
+                ..
+            }] if s == "2."
+        ));
+    }
+
+    #[test]
+    fn newline_before_dot_does_not_fold_into_field_access() {
+        // Issue #659: a postfix `.` starting a new line must not fold into the
+        // preceding line's expression as a member access.
+        let r = parse_file("t.hy", "fn main() {\n    x := 1\n    .foo\n}\n");
+        assert!(
+            r.is_err(),
+            "leading `.foo` on a new line must not fold into previous statement: {:?}",
+            r
+        );
+    }
 }

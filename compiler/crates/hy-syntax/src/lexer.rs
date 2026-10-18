@@ -504,9 +504,24 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        // fractional part — only when a digit follows the dot (so `0..n`
-        // lexes as Int(0) + `..` + Int(n), and `1..=8` as Int + `..=` + Int)
-        if self.at(0) == Some('.') && self.at(1).map(|d| d.is_ascii_digit()) == Some(true) {
+        // fractional part — accept `.` as part of the float literal unless
+        // followed by `.` (`0..n` and `1..=8` ranges) or by an identifier
+        // start that is not a float exponent (`2.foo` stays Int(2) + `.` +
+        // Ident(foo), while `2.`, `2.5`, and `2.e3` lex as Float per LX6).
+        let has_exp_after_dot = matches!(self.at(1), Some('e') | Some('E')) && {
+            let exp_digit_idx = if matches!(self.at(2), Some('+') | Some('-')) {
+                3
+            } else {
+                2
+            };
+            self.at(exp_digit_idx).map(|d| d.is_ascii_digit()) == Some(true)
+        };
+        let is_non_exp_ident_after_dot = self
+            .at(1)
+            .map(|c| c == '_' || c.is_ascii_alphabetic())
+            .unwrap_or(false)
+            && !has_exp_after_dot;
+        if self.at(0) == Some('.') && self.at(1) != Some('.') && !is_non_exp_ident_after_dot {
             is_float = true;
             s.push('.');
             self.bump();
@@ -1248,5 +1263,45 @@ mod tests {
         }
         let t = toks("m := map[string]int{}");
         assert!(t.iter().any(|t| matches!(t, Tok::Ident(s) if s == "map")));
+    }
+
+    #[test]
+    fn trailing_dot_float_literals_lex_as_float_without_breaking_ranges() {
+        // LX6 (#659): `2.`, `2.e3`, `2.E-4`, `0.` are valid float literals,
+        // while `0..n` and `1..=8` ranges and `2.foo` member access tokens stay intact.
+        let t = toks(
+            "a := 2.\nb := 2. + 1.0\nc := 2.e3\nd := 2.E-4\nfor i in 0..3 {}\nfor j in 1..=8 {}",
+        );
+        assert!(
+            t.contains(&Tok::Float("2.".into())),
+            "expected Float(\"2.\") in {:?}",
+            t
+        );
+        assert!(
+            t.contains(&Tok::Float("2.e3".into())),
+            "expected Float(\"2.e3\") in {:?}",
+            t
+        );
+        assert!(
+            t.contains(&Tok::Float("2.E-4".into())),
+            "expected Float(\"2.E-4\") in {:?}",
+            t
+        );
+        assert!(t.contains(&Tok::Int("0".into())));
+        assert!(t.contains(&Tok::Punct("..")));
+        assert!(t.contains(&Tok::Punct("..=")));
+
+        let member_toks = toks("x := 2.foo");
+        assert_eq!(
+            member_toks,
+            vec![
+                Tok::Ident("x".into()),
+                Tok::Punct(":="),
+                Tok::Int("2".into()),
+                Tok::Punct("."),
+                Tok::Ident("foo".into()),
+                Tok::Eof,
+            ]
+        );
     }
 }
