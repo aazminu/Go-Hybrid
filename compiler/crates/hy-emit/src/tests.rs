@@ -2908,3 +2908,42 @@ fn m4_initialism_mapping_for_foreign_go_names_issue_658() {
     assert!(go.contains("strings.ToValidUTF8(\"a\", \"b\")"), "expected strings.ToValidUTF8, got:\n{}", go);
 }
 
+#[test]
+fn fn_type_local_and_struct_field_emit_valid_go_issue_727() {
+    let src = r#"
+package main
+
+import "fmt"
+
+struct handler {
+    on_event fn(int) bool
+    name string
+}
+
+fn main() {
+    var cb fn() int
+    fmt.println(cb == nil)
+    var f fn(u8) (int, error)
+    _ = f
+    h := handler{on_event: fn(x int) bool { return x > 0 }, name: "click"}
+    fmt.println(h.name, h.on_event(1))
+}
+"#;
+    let go = emit(src);
+    assert!(
+        go.contains("var cb func() int\n\tfmt.Println(cb == nil)"),
+        "var cb fn() int must not absorb following statement:\n{}",
+        go
+    );
+    assert!(
+        go.contains("var f func(uint8) (int, error)"),
+        "unnamed primitive param and multi-result fn type must emit valid Go:\n{}",
+        go
+    );
+    assert!(
+        go.contains("on_event func(int) bool") && go.contains("name") && go.contains("h.name"),
+        "struct fields after fn-typed field must be preserved:\n{}",
+        go
+    );
+}
+
