@@ -5676,6 +5676,13 @@ impl<'a> Checker<'a> {
                     walk::expr_calls(expr, &mut calls);
                 } else {
                     walk::own_calls(stmt, &mut calls);
+                    if let Stmt::Task { callee, args, span } = stmt {
+                        calls.push(walk::CallRef {
+                            callee,
+                            args,
+                            span: *span,
+                        });
+                    }
                 }
                 for cr in &calls {
                     self.check_delete_const(&cst, cr, &HashSet::new());
@@ -5986,7 +5993,12 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_delete_const(&mut self, st: &FnState, cr: &CallRef, declared: &HashSet<String>) {
+    pub(crate) fn check_delete_const(
+        &mut self,
+        st: &FnState,
+        cr: &CallRef,
+        declared: &HashSet<String>,
+    ) {
         let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) else {
             return;
         };
@@ -6069,7 +6081,12 @@ impl<'a> Checker<'a> {
     /// reject the call site with `HYB-E3006` (`cannot write to const`).
     /// Read-only helpers (`len(shared_map)`, `count(shared_map)`) do not
     /// mutate the parameter and remain accepted.
-    fn check_call_const_writes(&mut self, st: &FnState, cr: &CallRef, declared: &HashSet<String>) {
+    pub(crate) fn check_call_const_writes(
+        &mut self,
+        st: &FnState,
+        cr: &CallRef,
+        declared: &HashSet<String>,
+    ) {
         let callee = crate::model::unwrap_parens(cr.callee);
         if let Expr::Ident { name, .. } = callee {
             if name == "delete"
@@ -6128,7 +6145,41 @@ impl<'a> Checker<'a> {
             }
         }
         for (i, a) in cr.args.iter().enumerate() {
-            let Some(const_name) = self.const_arg_root(st, &a.value, declared) else {
+            let inner_arg = crate::model::unwrap_parens(&a.value);
+            let auto_addr_ptr = match callee {
+                Expr::Ident { name, .. } if !declared.contains(name) => {
+                    self.lookup_binding(st, name).is_none()
+                        && self
+                            .fns
+                            .get(name)
+                            .and_then(|decl| decl.params.get(i))
+                            .map(|p| matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_)))
+                            .unwrap_or(false)
+                        && !matches!(self.shape_of_expr(st, inner_arg), TypeShape::Pointer(_))
+                        && matches!(
+                            inner_arg,
+                            Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. }
+                        )
+                }
+                _ => false,
+            };
+            let arg_const = if auto_addr_ptr {
+                inner_arg
+                    .root_ident()
+                    .filter(|root| !declared.contains(*root))
+                    .and_then(|root| {
+                        self.const_write_root(
+                            st,
+                            &Place {
+                                kind: PlaceKind::Ident(root.to_string()),
+                                span: a.value.span(),
+                            },
+                        )
+                    })
+            } else {
+                self.const_arg_root(st, &a.value, declared)
+            };
+            let Some(const_name) = arg_const else {
                 continue;
             };
             let mutates = match callee {

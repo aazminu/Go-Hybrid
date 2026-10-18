@@ -614,6 +614,14 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     Some(callee),
                     targets.as_deref(),
                 );
+                let task_cr = walk::CallRef {
+                    callee,
+                    args,
+                    span: *span,
+                };
+                ck.check_delete_const(&st, &task_cr, &std::collections::HashSet::new());
+                ck.check_call_const_writes(&st, &task_cr, &std::collections::HashSet::new());
+                ck.record_callee_param_stores(&mut st, &task_cr);
             }
 
             // O4.0 check-site: the sent value (HYB-E3002). The parser flags
@@ -5129,5 +5137,107 @@ mod tests {
             .count();
         assert_eq!(e3006_count, 2, "{:?}", r.diagnostics);
     }
-}
 
+    #[test]
+    fn ptr_param_auto_addressing_enforces_sendability_and_const_writes() {
+        // Issue #694: `task worker(s, done)` where `worker(s *stats, ...)` is
+        // lowered by `hy-emit` to `go worker(&s, done)` — must classify `s`
+        // as an implicit `&s` borrow (`HYB-E3001`) and check T22 const writes
+        // (`HYB-E3006`).
+        let task_const = check(
+            "struct stats { n int }\n\
+             fn worker(s *stats, done chan<- bool) {\n\
+               s.n = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               const s = stats{n: 0}\n\
+               done := make(chan bool, 1)\n\
+               task worker(s, done)\n\
+               fmt.println(s.n)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            task_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            task_const.diagnostics
+        );
+        assert!(
+            task_const.diagnostics.iter().any(|d| d.code == "HYB-E3001"),
+            "{:?}",
+            task_const.diagnostics
+        );
+        assert!(
+            task_const.diagnostics.iter().any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            task_const.diagnostics
+        );
+
+        // Synchronous call `worker(s)` where `worker(s *stats)` mutates `s.n`
+        // is lowered to `worker(&s)` and must also reject `const s` (`HYB-E3006`).
+        let sync_const = check(
+            "struct stats { n int }\n\
+             fn worker(s *stats) {\n\
+               s.n = 1\n\
+             }\n\
+             fn main() {\n\
+               const s = stats{n: 0}\n\
+               worker(s)\n\
+             }",
+        );
+        assert_eq!(
+            sync_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            sync_const.diagnostics
+        );
+        assert!(
+            sync_const.diagnostics.iter().any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            sync_const.diagnostics
+        );
+
+        // Read-only synchronous pointer parameter on `const s` remains legal.
+        let sync_readonly = check(
+            "struct stats { n int }\n\
+             fn reader(s *stats) int {\n\
+               return s.n\n\
+             }\n\
+             fn main() {\n\
+               const s = stats{n: 0}\n\
+               fmt.println(reader(s))\n\
+             }",
+        );
+        assert_eq!(
+            sync_readonly.verdict,
+            Verdict::Accept,
+            "{:?}",
+            sync_readonly.diagnostics
+        );
+        assert!(sync_readonly.diagnostics.is_empty());
+
+        // Auto-addressed `atomic.int64` at a `*atomic.int64` task parameter
+        // remains legal (Class 2 `*atomic.T`).
+        let task_atomic = check(
+            "fn bump(h *atomic.int64, done chan<- bool) {\n\
+               h.add(1)\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               var hits atomic.int64\n\
+               done := make(chan bool, 1)\n\
+               task bump(hits, done)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            task_atomic.verdict,
+            Verdict::Accept,
+            "{:?}",
+            task_atomic.diagnostics
+        );
+        assert!(task_atomic.diagnostics.is_empty());
+    }
+}

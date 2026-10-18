@@ -1174,7 +1174,23 @@ impl<'a> Checker<'a> {
                 None
             };
 
-            match self.classify_value(st, v) {
+            let inner_v = crate::model::unwrap_parens(v);
+            let auto_addr_ptr = code == "HYB-E3001"
+                && matches!(
+                    target_shapes.and_then(|ts| ts.get(vi)),
+                    Some(TypeShape::Pointer(_))
+                )
+                && !matches!(self.shape_of_expr(st, inner_v), TypeShape::Pointer(_))
+                && matches!(
+                    inner_v,
+                    Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. }
+                );
+            let outcome = if auto_addr_ptr {
+                self.classify_addr_of(st, v, inner_v)
+            } else {
+                self.classify_value(st, v)
+            };
+            match outcome {
                 Outcome::Ok => {
                     if let Some((got, want)) = send_elem_mismatch {
                         self.emit_chan_elem_mismatch_send(
