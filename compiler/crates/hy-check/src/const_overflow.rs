@@ -29,6 +29,14 @@ impl<'a> Checker<'a> {
         value: &Expr,
         st: Option<&FnState>,
     ) {
+        let val_span = value.span();
+        if self
+            .diags
+            .iter()
+            .any(|d| d.code == "HYB-E6002" && d.span == val_span)
+        {
+            return;
+        }
         let resolved = self.resolve_type_alias(ty);
         let TypeExpr::Named {
             name: ty_name,
@@ -76,7 +84,7 @@ impl<'a> Checker<'a> {
         let Some((lo, hi)) = fixed_width_int_range(ty_name) else {
             return;
         };
-        match const_int_fold_with(value, &self.const_values, 0, st) {
+        match self.const_int_fold_expr(value, st) {
             ConstFold::NotConst => {}
             ConstFold::TooBig => {
                 let span = value.span();
@@ -229,7 +237,7 @@ impl<'a> Checker<'a> {
         let Some((lo, hi)) = fixed_width_int_range(ty_name) else {
             return;
         };
-        match const_int_fold_with(value, &self.const_values, 0, st) {
+        match self.const_int_fold_expr(value, st) {
             ConstFold::NotConst => {}
             ConstFold::TooBig => {
                 let span = value.span();
@@ -325,8 +333,11 @@ impl<'a> Checker<'a> {
         value: &Expr,
         st: Option<&FnState>,
     ) {
+        if self.typed_const_expr_type(st, value, 0).is_some() {
+            return;
+        }
         let (lo, hi) = target_int_range();
-        match const_int_fold_with(value, &self.const_values, 0, st) {
+        match self.const_int_fold_expr(value, st) {
             ConstFold::NotConst => return,
             ConstFold::Val(v) if v >= lo && v <= hi => return,
             ConstFold::Val(_) | ConstFold::TooBig => {}
@@ -387,6 +398,244 @@ impl<'a> Checker<'a> {
     /// Fold a constant float expression (literals, identifiers, unary, binary).
     pub(crate) fn const_float_fold(&self, e: &Expr, st: Option<&FnState>) -> Option<f64> {
         const_float_fold_with(e, &self.const_values, 0, st)
+    }
+
+    /// Fold an integer constant expression, including local/file `const`
+    /// declarations and integer conversion calls (`u8(255)`, `i64(1)`).
+    pub(crate) fn const_int_fold_expr(&self, e: &Expr, st: Option<&FnState>) -> ConstFold {
+        self.const_int_fold_expr_depth(e, 0, st)
+    }
+
+    fn const_int_fold_expr_depth(&self, e: &Expr, depth: u32, st: Option<&FnState>) -> ConstFold {
+        if depth > 16 {
+            return ConstFold::NotConst;
+        }
+        match unwrap_parens(e) {
+            Expr::Lit {
+                kind: LitKind::Int(s),
+                ..
+            } => match parse_int_lit(s) {
+                Some(ConstInt::Value(v)) => ConstFold::Val(v),
+                Some(ConstInt::PosOverflow | ConstInt::NegOverflow) => ConstFold::TooBig,
+                None => ConstFold::NotConst,
+            },
+            Expr::Lit {
+                kind: LitKind::Char(c),
+                ..
+            } => ConstFold::Val(*c as i128),
+            Expr::Ident { name, span } => {
+                if let Some((decl_ty, init_val, _)) =
+                    self.resolve_local_const_decl_at(name, span.start)
+                {
+                    let folded = self.const_int_fold_expr_depth(init_val, depth + 1, st);
+                    if let Some(ty) = decl_ty {
+                        let resolved = self.resolve_type_alias(ty);
+                        if let TypeExpr::Named { name: tname, .. } = &resolved {
+                            if let Some((lo, hi)) = fixed_width_int_range(tname) {
+                                return match folded {
+                                    ConstFold::Val(v) if v >= lo && v <= hi => ConstFold::Val(v),
+                                    _ => ConstFold::NotConst,
+                                };
+                            }
+                        }
+                    }
+                    return folded;
+                }
+                if let Some(st) = st {
+                    if st.env_lookup(name).is_some() {
+                        return ConstFold::NotConst;
+                    }
+                }
+                if let Some(c) = self.file.decls.iter().find_map(|d| match d {
+                    hy_syntax::Decl::Const(c) if c.name == *name => Some(c),
+                    _ => None,
+                }) {
+                    let folded = self.const_int_fold_expr_depth(&c.value, depth + 1, None);
+                    if let Some(ty) = &c.ty {
+                        let resolved = self.resolve_type_alias(ty);
+                        if let TypeExpr::Named { name: tname, .. } = &resolved {
+                            if let Some((lo, hi)) = fixed_width_int_range(tname) {
+                                return match folded {
+                                    ConstFold::Val(v) if v >= lo && v <= hi => ConstFold::Val(v),
+                                    _ => ConstFold::NotConst,
+                                };
+                            }
+                        }
+                    }
+                    return folded;
+                }
+                if let Some(v) = self.const_values.get(name) {
+                    return self.const_int_fold_expr_depth(v, depth + 1, None);
+                }
+                ConstFold::NotConst
+            }
+            Expr::Call { callee, args, span } if args.len() == 1 && !args[0].spread => {
+                let Expr::Ident { name, .. } = unwrap_parens(callee) else {
+                    return ConstFold::NotConst;
+                };
+                if st.is_some_and(|s| s.env_lookup(name).is_some())
+                    || self.fns.contains_key(name.as_str())
+                {
+                    return ConstFold::NotConst;
+                }
+                let candidate = TypeExpr::Named {
+                    name: name.clone(),
+                    span: *span,
+                };
+                let resolved = self.resolve_type_alias(&candidate);
+                let TypeExpr::Named { name: target, .. } = &resolved else {
+                    return ConstFold::NotConst;
+                };
+                let Some((lo, hi)) = fixed_width_int_range(target) else {
+                    return ConstFold::NotConst;
+                };
+                match self.const_int_fold_expr_depth(&args[0].value, depth + 1, st) {
+                    ConstFold::Val(v) => {
+                        if v >= lo && v <= hi {
+                            ConstFold::Val(v)
+                        } else if !is_64bit_int_target(target) {
+                            let len = (hi - lo) + 1;
+                            let masked = v.rem_euclid(len);
+                            let wrapped = if lo < 0 && masked > hi {
+                                masked - len
+                            } else {
+                                masked
+                            };
+                            ConstFold::Val(wrapped)
+                        } else {
+                            ConstFold::NotConst
+                        }
+                    }
+                    _ => ConstFold::NotConst,
+                }
+            }
+            Expr::Unary {
+                op: UnOp::Neg,
+                operand,
+                ..
+            } => match self.const_int_fold_expr_depth(operand, depth + 1, st) {
+                ConstFold::Val(v) => v.checked_neg().map(ConstFold::Val).unwrap_or(ConstFold::TooBig),
+                ConstFold::NotConst => ConstFold::NotConst,
+                ConstFold::TooBig => ConstFold::TooBig,
+            },
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let l = self.const_int_fold_expr_depth(lhs, depth + 1, st);
+                let r = self.const_int_fold_expr_depth(rhs, depth + 1, st);
+                fold_bin(*op, l, r)
+            }
+            _ => ConstFold::NotConst,
+        }
+    }
+
+    /// Returns `Some(ty)` when `expr` is a typed integer constant expression
+    /// in Go (e.g. `top + 1` where `const top u8 = 255`, `u8(255) + 1`,
+    /// `i64(1) << 63`, `-u8(1)`). Returns `None` for untyped constants or
+    /// non-constant expressions.
+    pub(crate) fn typed_const_expr_type(
+        &self,
+        st: Option<&FnState>,
+        expr: &Expr,
+        depth: u32,
+    ) -> Option<TypeExpr> {
+        if depth > 16 {
+            return None;
+        }
+        if matches!(self.const_int_fold_expr_depth(expr, 0, st), ConstFold::NotConst) {
+            return None;
+        }
+        match unwrap_parens(expr) {
+            Expr::Lit { .. } => None,
+            Expr::Ident { name, span } => {
+                if let Some((decl_ty, init_val, _)) =
+                    self.resolve_local_const_decl_at(name, span.start)
+                {
+                    if let Some(ty) = decl_ty {
+                        let resolved = self.resolve_type_alias(ty);
+                        if matches!(&resolved, TypeExpr::Named { name: n, .. } if fixed_width_int_range(n).is_some()) {
+                            return Some(resolved);
+                        }
+                        return None;
+                    }
+                    return self.typed_const_expr_type(st, init_val, depth + 1);
+                }
+                if st.is_some_and(|s| s.env_lookup(name).is_some()) {
+                    return None;
+                }
+                let c = self.file.decls.iter().find_map(|d| match d {
+                    hy_syntax::Decl::Const(c) if c.name == *name => Some(c),
+                    _ => None,
+                })?;
+                if let Some(ty) = &c.ty {
+                    let resolved = self.resolve_type_alias(ty);
+                    if matches!(&resolved, TypeExpr::Named { name: n, .. } if fixed_width_int_range(n).is_some()) {
+                        return Some(resolved);
+                    }
+                    return None;
+                }
+                self.typed_const_expr_type(None, &c.value, depth + 1)
+            }
+            Expr::Call { callee, args, span } if args.len() == 1 && !args[0].spread => {
+                let Expr::Ident { name, .. } = unwrap_parens(callee) else {
+                    return None;
+                };
+                if st.is_some_and(|s| s.env_lookup(name).is_some())
+                    || self.fns.contains_key(name.as_str())
+                {
+                    return None;
+                }
+                let candidate = TypeExpr::Named {
+                    name: name.clone(),
+                    span: *span,
+                };
+                let resolved = self.resolve_type_alias(&candidate);
+                if matches!(&resolved, TypeExpr::Named { name: n, .. } if fixed_width_int_range(n).is_some()) {
+                    Some(resolved)
+                } else {
+                    None
+                }
+            }
+            Expr::Unary {
+                op: UnOp::Neg,
+                operand,
+                ..
+            } => self.typed_const_expr_type(st, operand, depth + 1),
+            Expr::Binary { op, lhs, rhs, .. } => match op {
+                BinOp::Shl | BinOp::Shr => self.typed_const_expr_type(st, lhs, depth + 1),
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::BitAnd => {
+                    let lt = self.typed_const_expr_type(st, lhs, depth + 1);
+                    let rt = self.typed_const_expr_type(st, rhs, depth + 1);
+                    match (lt, rt) {
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (Some(l), Some(r)) => {
+                            let lr = match &l {
+                                TypeExpr::Named { name, .. } => fixed_width_int_range(name),
+                                _ => None,
+                            };
+                            let rr = match &r {
+                                TypeExpr::Named { name, .. } => fixed_width_int_range(name),
+                                _ => None,
+                            };
+                            if lr.is_some() && lr == rr {
+                                Some(l)
+                            } else {
+                                None
+                            }
+                        }
+                        (None, None) => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     // -----------------------------------------------------------------------

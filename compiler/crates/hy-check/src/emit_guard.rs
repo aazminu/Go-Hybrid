@@ -400,22 +400,15 @@ impl<'a> Checker<'a> {
                     BinOp::Shl | BinOp::Shr => self.check_negative_shift(rhs, *span),
                     _ => {}
                 }
-                self.check_binary_const_overflow(st, *op, lhs, rhs);
-                self.check_typed_const_result(st, expr, *op, lhs, rhs, *span);
+                self.check_binary_const_overflow(st, expr, *op, lhs, rhs);
             }
-            // `-u8(1)` is `constant -1 of type uint8 overflows uint8` in Go;
-            // the combined operand-recursing arm below would only walk into
-            // the operand and never range-check the negation (#725).
-            Expr::Unary {
-                op: hy_syntax::UnOp::Neg,
-                operand,
-                span,
-            } => {
+            Expr::Unary { op, operand, .. } => {
                 self.check_expr_emit_guard(st, operand);
-                self.check_negated_const_result(st, operand, *span);
+                if matches!(op, hy_syntax::UnOp::Neg) {
+                    self.check_typed_const_expr_overflow(st, expr, "unary expression");
+                }
             }
-            Expr::Unary { operand, .. }
-            | Expr::AddrOf { operand, .. }
+            Expr::AddrOf { operand, .. }
             | Expr::Move { operand, .. }
             | Expr::Try { operand, .. }
             | Expr::Paren { inner: operand, .. }
@@ -1558,6 +1551,15 @@ impl<'a> Checker<'a> {
         None
     }
 
+    pub(crate) fn resolve_local_const_decl_at(
+        &self,
+        name: &str,
+        use_pos: hy_diag::Pos,
+    ) -> Option<(&'a Option<TypeExpr>, &'a Expr, hy_diag::Pos)> {
+        let sight = self.resolve_local_binding_at(name, use_pos)?;
+        Some((sight.ty, sight.constant_initializer()?, sight.pos))
+    }
+
     /// Length of the fixed-size array that `expr` denotes, when it is known
     /// exactly.
     ///
@@ -2003,196 +2005,61 @@ impl<'a> Checker<'a> {
         (s.end.line, s.end.col) <= (pos.line, pos.col)
     }
 
-    fn check_binary_const_overflow(&mut self, st: &FnState, op: BinOp, lhs: &Expr, rhs: &Expr) {
-        if matches!(op, BinOp::Shl | BinOp::Shr) {
-            return;
-        }
-
-        let desc = match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => "comparison",
-            _ => "binary expression",
-        };
-
-        if let Some(lhs_ty) = self.ty_of_expr(st, lhs) {
-            let resolved = self.resolve_type_alias(&lhs_ty);
-            self.check_const_overflow_init(desc, &resolved, rhs, Some(st));
-        }
-
-        if let Some(rhs_ty) = self.ty_of_expr(st, rhs) {
-            let resolved = self.resolve_type_alias(&rhs_ty);
-            self.check_const_overflow_init(desc, &resolved, lhs, Some(st));
-        }
-    }
-
-    /// The fixed-width integer type an expression's VALUE has, when the
-    /// checker can name it: a conversion (`u8(x)` -> `u8`) or a file-level
-    /// `const` with a declared fixed-width type (`const top u8 = 255`).
-    ///
-    /// `None` means "not provably a fixed-width integer". This predicate
-    /// gates a diagnostic, so an unknown shape must fail open.
-    fn fixed_width_int_ty_of(&self, st: &FnState, e: &Expr) -> Option<(String, i128, i128)> {
-        let e = unwrap_parens(e);
-        if let Some(ty) = self.ty_of_expr(st, e) {
-            if let TypeExpr::Named { name, .. } = self.resolve_type_alias(&ty) {
-                if let Some((lo, hi)) = fixed_width_int_range(&name) {
-                    return Some((name, lo, hi));
-                }
-            }
-        }
-        // A file-level `const` is not a local binding, so `ty_of_expr` has no
-        // entry for it; read the declaration's own type annotation instead.
-        // `const top u8 = 255; top + 1` is the shape this exists for.
-        if let Expr::Ident { name, .. } = e {
-            let decl = self.file.decls.iter().find_map(|d| match d {
-                hy_syntax::Decl::Const(c) if c.name == *name => Some(c),
-                _ => None,
+    fn check_typed_const_expr_overflow(&mut self, st: &FnState, expr: &Expr, desc: &str) {
+        if let Some(const_ty) = self.typed_const_expr_type(Some(st), expr, 0) {
+            let span = expr.span();
+            let child_already_failed = self.diags.iter().any(|d| {
+                (d.code == "HYB-E6002" || d.code == "HYB-E6006" || d.code == "HYB-E6005")
+                    && span_contains(span, d.span.start)
             });
-            if let Some(ty) = decl.and_then(|c| c.ty.as_ref()) {
-                if let TypeExpr::Named { name: tn, .. } = self.resolve_type_alias(ty) {
-                    if let Some((lo, hi)) = fixed_width_int_range(&tn) {
-                        return Some((tn, lo, hi));
-                    }
-                }
+            if !child_already_failed {
+                self.check_const_overflow_init(desc, &const_ty, expr, Some(st));
             }
         }
-        None
     }
 
-    /// #725 — the folded result of a TYPED constant expression must stay
-    /// inside its type's range.
-    ///
-    /// Go folds constant expressions *before* the range check, so
-    /// `u8(255) + 1` is `constant 256 of type uint8 overflows uint8`. The
-    /// per-operand checks in `check_binary_const_overflow` cannot see that:
-    /// 255 fits `u8` and 1 fits `u8`, so both pass and the sum is never
-    /// computed.
-    ///
-    /// Fail-open by construction — `const_int_fold_with` answers `NotConst`
-    /// for any operand that is not a constant, which is exactly what keeps
-    /// `var x u8 = 200; x + 1` (a run-time wrap, SPEC X1/X2) accepted. Only a
-    /// genuinely folded constant can reach the range check.
-    fn check_typed_const_result(
+    fn check_binary_const_overflow(
         &mut self,
         st: &FnState,
         expr: &Expr,
         op: BinOp,
         lhs: &Expr,
         rhs: &Expr,
-        span: Span,
     ) {
-        // A comparison yields a bool, not the operand's type.
+        if !matches!(op, BinOp::Shl | BinOp::Shr) {
+            let desc = match op {
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    "comparison"
+                }
+                _ => "binary expression",
+            };
+
+            if let Some(lhs_ty) = self.ty_of_expr(st, lhs) {
+                let resolved = self.resolve_type_alias(&lhs_ty);
+                self.check_const_overflow_init(desc, &resolved, rhs, Some(st));
+            }
+
+            if let Some(rhs_ty) = self.ty_of_expr(st, rhs) {
+                let resolved = self.resolve_type_alias(&rhs_ty);
+                self.check_const_overflow_init(desc, &resolved, lhs, Some(st));
+            }
+        }
+
         if matches!(
             op,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::BitAnd
+                | BinOp::Shl
+                | BinOp::Shr
         ) {
-            return;
+            self.check_typed_const_expr_overflow(st, expr, "binary expression");
         }
-        let lhs_ty = self.fixed_width_int_ty_of(st, lhs);
-        let rhs_ty = self.fixed_width_int_ty_of(st, rhs);
-        // Go's shift rule: the result takes the LEFT operand's type, and an
-        // untyped left operand STAYS untyped — so the right operand's type
-        // says nothing about a shift's range (`1 << u8(20)` builds).
-        let want = if matches!(op, BinOp::Shl | BinOp::Shr) {
-            lhs_ty
-        } else {
-            match (lhs_ty, rhs_ty) {
-                // Mismatched operand types are a different rule's business.
-                (Some(a), Some(b)) if a.0 != b.0 => return,
-                (Some(a), _) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => return,
-            }
-        };
-        let Some((ty_name, lo, hi)) = want else {
-            return;
-        };
-
-        let l = const_int_fold_with(lhs, &self.const_values, 0, Some(st));
-        let r = const_int_fold_with(rhs, &self.const_values, 0, Some(st));
-        match fold_bin(op, l, r) {
-            ConstFold::Val(v) if v < lo || v > hi => {
-                self.emit_typed_const_overflow(&ty_name, Some(v), lo, hi, span, expr);
-            }
-            ConstFold::TooBig => {
-                self.emit_typed_const_overflow(&ty_name, None, lo, hi, span, expr);
-            }
-            _ => {}
-        }
-    }
-
-    /// `-u8(1)` is `constant -1 of type uint8 overflows uint8` in Go. The
-    /// negation's own type is the operand's, so the range check applies to the
-    /// negated value (#725).
-    fn check_negated_const_result(&mut self, st: &FnState, operand: &Expr, span: Span) {
-        let Some((ty_name, lo, hi)) = self.fixed_width_int_ty_of(st, operand) else {
-            return;
-        };
-        let ConstFold::Val(v) = const_int_fold_with(operand, &self.const_values, 0, Some(st))
-        else {
-            return;
-        };
-        let Some(neg) = v.checked_neg() else {
-            return;
-        };
-        if neg < lo || neg > hi {
-            let rendered = format!("-{}", operand.render());
-            let msg = format!(
-                "constant expression `{}` overflows declared type `{}` ({} is outside [{}, {}]) (HYB-E6002)",
-                rendered, ty_name, neg, lo, hi
-            );
-            let notes = vec![
-                format!(
-                    "why: Go folds the constant and rejects a result outside `{}` (`constant {} of type {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
-                    ty_name, neg, ty_name, ty_name
-                ),
-                format!(
-                    "fix: keep the result in [{}, {}]. A run-time value wraps instead (SPEC X1/X2), but a CONSTANT negation is folded by Go and refused",
-                    lo, hi
-                ),
-            ];
-            self.diags.push(
-                Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
-            );
-        }
-    }
-
-    /// Shared HYB-E6002 emission for a typed constant expression whose folded
-    /// result is outside its type's range. `value` is `None` when the fold was
-    /// provably larger than `i128` (`TooBig`).
-    fn emit_typed_const_overflow(
-        &mut self,
-        ty_name: &str,
-        value: Option<i128>,
-        lo: i128,
-        hi: i128,
-        span: Span,
-        expr: &Expr,
-    ) {
-        let shown = match value {
-            Some(v) => v.to_string(),
-            None => "a value beyond i128".to_string(),
-        };
-        let msg = format!(
-            "constant expression `{}` overflows declared type `{}` ({} is outside [{}, {}]) (HYB-E6002)",
-            expr.render(),
-            ty_name,
-            shown,
-            lo,
-            hi
-        );
-        let notes = vec![
-            format!(
-                "why: Go folds a constant expression before the range check and rejects a result outside `{}` (`constant {} of type {} overflows {}`), so an accepted Hybrid program would emit unbuildable Go (issue #725)",
-                ty_name, shown, ty_name, ty_name
-            ),
-            format!(
-                "fix: keep the result in [{}, {}], or widen the operand's type. A run-time value wraps (SPEC X1/X2), but a constant expression is folded by Go and refused",
-                lo, hi
-            ),
-        ];
-        self.diags.push(
-            Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
-        );
     }
 
     pub(crate) fn check_file_map_literal_duplicate_keys(&mut self) {

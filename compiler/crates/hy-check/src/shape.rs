@@ -697,7 +697,12 @@ impl<'a> Checker<'a> {
             }),
             Expr::Move { operand, .. }
             | Expr::Try { operand, .. }
-            | Expr::Paren { inner: operand, .. } => self.ty_of_expr(st, operand),
+            | Expr::Paren { inner: operand, .. }
+            | Expr::Unary {
+                op: hy_syntax::UnOp::Neg,
+                operand,
+                ..
+            } => self.ty_of_expr(st, operand),
             Expr::Call { callee, args, span } => match crate::model::unwrap_parens(callee) {
                 Expr::FnLit { results, .. } => results.first().map(|r| r.ty.clone()),
                 Expr::Ident { name, .. } => {
@@ -796,6 +801,9 @@ impl<'a> Checker<'a> {
                 }
             },
             Expr::Binary { op, lhs, rhs, .. } => {
+                if matches!(op, hy_syntax::BinOp::Shl | hy_syntax::BinOp::Shr) {
+                    return self.ty_of_expr(st, lhs);
+                }
                 if matches!(
                     op,
                     hy_syntax::BinOp::Add
