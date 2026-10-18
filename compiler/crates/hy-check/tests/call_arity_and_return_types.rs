@@ -325,6 +325,14 @@ fn fn_type_local_and_struct_field_soundness_issue_727() {
         "package main\n\nfn main() {\n    var f fn(u8) int\n    _ = f(999)\n}\n",
         "HYB-E6002",
     );
+    assert_code(
+        "package main\n\ntype cb = fn(u8) int\n\nfn main() {\n    var f cb\n    _ = f(999)\n}\n",
+        "HYB-E6002",
+    );
+    assert_code(
+        "package main\n\nstruct handler {\n    on_event fn(u8) bool\n}\n\nfn main() {\n    var h handler\n    _ = h.on_event(999)\n}\n",
+        "HYB-E6002",
+    );
     assert!(
         codes("package main\n\nfn main() {\n    var f fn([no_such_const]int) int\n    _ = f\n}\n")
             .contains(&"HYB-E1001".to_string())

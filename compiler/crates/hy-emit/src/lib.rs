@@ -1687,6 +1687,10 @@ impl Emitter {
             TypeExpr::Fn {
                 params, results, ..
             } => {
+                let all_named = params.iter().all(|p| {
+                    !p.name.is_empty()
+                        && !matches!(&p.ty, TypeExpr::Named { name, .. } if name.is_empty())
+                });
                 let ps = params
                     .iter()
                     .map(|p| {
@@ -1695,8 +1699,10 @@ impl Emitter {
                             t
                         } else if t.is_empty() {
                             self.go_type_name(&p.name)
-                        } else {
+                        } else if all_named {
                             format!("{} {}", p.name, t)
+                        } else {
+                            t
                         }
                     })
                     .collect::<Vec<_>>()

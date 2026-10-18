@@ -2925,6 +2925,8 @@ fn main() {
     fmt.println(cb == nil)
     var f fn(u8) (int, error)
     _ = f
+    var mixed fn(x int, string) bool
+    _ = mixed
     h := handler{on_event: fn(x int) bool { return x > 0 }, name: "click"}
     fmt.println(h.name, h.on_event(1))
 }
@@ -2938,6 +2940,11 @@ fn main() {
     assert!(
         go.contains("var f func(uint8) (int, error)"),
         "unnamed primitive param and multi-result fn type must emit valid Go:\n{}",
+        go
+    );
+    assert!(
+        go.contains("var mixed func(int, string) bool"),
+        "mixed named and unnamed fn-type params must emit unnamed Go params:\n{}",
         go
     );
     assert!(
