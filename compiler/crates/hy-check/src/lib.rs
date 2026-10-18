@@ -5239,5 +5239,69 @@ mod tests {
             task_atomic.diagnostics
         );
         assert!(task_atomic.diagnostics.is_empty());
+
+        // Re-sliced index (`items[:][0]`) passed to a `*stats` parameter is
+        // also auto-addressed by `hy-emit` (`&items[:][0]`) and must enforce
+        // both `HYB-E3001` and `HYB-E3006`.
+        let resliced_task_const = check(
+            "struct stats { n int }\n\
+             fn worker(s *stats, done chan<- bool) {\n\
+               s.n = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               const items = []stats{stats{n: 0}}\n\
+               done := make(chan bool, 1)\n\
+               task worker(items[:][0], done)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            resliced_task_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            resliced_task_const.diagnostics
+        );
+        assert!(
+            resliced_task_const
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3001"),
+            "{:?}",
+            resliced_task_const.diagnostics
+        );
+        assert!(
+            resliced_task_const
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            resliced_task_const.diagnostics
+        );
+
+        let resliced_sync_const = check(
+            "struct stats { n int }\n\
+             fn worker(s *stats) {\n\
+               s.n = 1\n\
+             }\n\
+             fn main() {\n\
+               const items = []stats{stats{n: 0}}\n\
+               worker(items[:][0])\n\
+             }",
+        );
+        assert_eq!(
+            resliced_sync_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            resliced_sync_const.diagnostics
+        );
+        assert!(
+            resliced_sync_const
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            resliced_sync_const.diagnostics
+        );
     }
 }

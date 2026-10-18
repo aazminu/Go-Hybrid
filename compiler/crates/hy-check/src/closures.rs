@@ -454,6 +454,13 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
         crate::walk::expr_calls(expr, &mut calls);
     } else {
         crate::walk::own_calls(stmt, &mut calls);
+        if let Stmt::Task { callee, args, span } = stmt {
+            calls.push(crate::walk::CallRef {
+                callee,
+                args,
+                span: *span,
+            });
+        }
     }
     for cr in &calls {
         if let Expr::Ident { name, .. } = crate::model::unwrap_parens(cr.callee) {

@@ -2899,6 +2899,13 @@ impl<'a> Checker<'a> {
             walk::expr_calls(expr, &mut calls);
         } else {
             walk::own_calls(stmt, &mut calls);
+            if let Stmt::Task { callee, args, span } = stmt {
+                calls.push(walk::CallRef {
+                    callee,
+                    args,
+                    span: *span,
+                });
+            }
         }
         for cr in &calls {
             self.walk_call_param_stores(cr, cst, aliases, param_names, depth, out);
@@ -5548,7 +5555,7 @@ impl<'a> Checker<'a> {
         if !matches!(operand, Expr::Index { .. } | Expr::Field { .. }) {
             return;
         }
-        let Some(root) = operand.root_ident() else {
+        let Some(root) = crate::model::place_root_ident(operand) else {
             return;
         };
         let place = Place {
@@ -6024,7 +6031,7 @@ impl<'a> Checker<'a> {
     ) -> Option<String> {
         let inner = crate::model::unwrap_parens(expr);
         if let Some(addr_op) = as_addr_of(inner) {
-            let root = addr_op.root_ident()?;
+            let root = crate::model::place_root_ident(addr_op)?;
             if declared.contains(root) {
                 return None;
             }
@@ -6043,7 +6050,7 @@ impl<'a> Checker<'a> {
         self.collect_callee_const_return_roots(st, inner, &mut roots, 0);
         collect_move_ident_sources(inner, &mut roots);
         if roots.is_empty() {
-            if let Some(r) = inner.root_ident() {
+            if let Some(r) = crate::model::place_root_ident(inner) {
                 roots.push(r.to_string());
             }
         }
@@ -6052,7 +6059,7 @@ impl<'a> Checker<'a> {
         for (op, _) in move_ops {
             let root = match op {
                 Expr::Ident { name, .. } => Some(name.as_str()),
-                Expr::Field { .. } => op.root_ident(),
+                Expr::Field { .. } => crate::model::place_root_ident(op),
                 _ => None,
             };
             if let Some(r) = root {
@@ -6121,7 +6128,7 @@ impl<'a> Checker<'a> {
                     if let Some(r) = &decl.receiver {
                         let ptr_recv = matches!(r.ty, hy_syntax::TypeExpr::Pointer { .. });
                         let recv_const = if ptr_recv {
-                            base.root_ident()
+                            crate::model::place_root_ident(base)
                                 .filter(|root| !declared.contains(*root))
                                 .and_then(|root| {
                                     self.const_write_root(
@@ -6132,6 +6139,7 @@ impl<'a> Checker<'a> {
                                         },
                                     )
                                 })
+                                .or_else(|| self.const_arg_root(st, base, declared))
                         } else {
                             self.const_arg_root(st, base, declared)
                         };
@@ -6164,8 +6172,7 @@ impl<'a> Checker<'a> {
                 _ => false,
             };
             let arg_const = if auto_addr_ptr {
-                inner_arg
-                    .root_ident()
+                crate::model::place_root_ident(inner_arg)
                     .filter(|root| !declared.contains(*root))
                     .and_then(|root| {
                         self.const_write_root(
@@ -6176,6 +6183,7 @@ impl<'a> Checker<'a> {
                             },
                         )
                     })
+                    .or_else(|| self.const_arg_root(st, &a.value, declared))
             } else {
                 self.const_arg_root(st, &a.value, declared)
             };
@@ -6290,13 +6298,13 @@ impl<'a> Checker<'a> {
     fn expr_reaches_const_aliases(expr: &Expr, aliases: &HashSet<String>) -> bool {
         let inner = crate::model::unwrap_parens(expr);
         if let Some(addr_op) = as_addr_of(inner) {
-            if let Some(r) = addr_op.root_ident() {
+            if let Some(r) = crate::model::place_root_ident(addr_op) {
                 if aliases.contains(r) {
                     return true;
                 }
             }
         }
-        if let Some(r) = inner.root_ident() {
+        if let Some(r) = crate::model::place_root_ident(inner) {
             if aliases.contains(r) {
                 return true;
             }

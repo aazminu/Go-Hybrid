@@ -869,13 +869,33 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// Like `Expr::root_ident()`, but also traverses `Expr::Slice` (`items[:][0]`)
+/// so re-sliced index/field places still resolve to their underlying root binding.
+pub(crate) fn place_root_ident(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Ident { name, .. } => Some(name),
+        Expr::Field { base, .. } | Expr::Index { base, .. } | Expr::Slice { base, .. } => {
+            place_root_ident(base)
+        }
+        Expr::AddrOf { operand, .. }
+        | Expr::Unary {
+            op: hy_syntax::UnOp::Addr,
+            operand,
+            ..
+        }
+        | Expr::Try { operand, .. } => place_root_ident(operand),
+        Expr::Paren { inner, .. } => place_root_ident(inner),
+        _ => None,
+    }
+}
+
 /// Collect root identifiers that are explicitly borrowed via address-of (`&x`) inside composite literals
 /// (e.g. `[]*T{&x}`, `map[K]*T{"k": &x}`, nested composite literals).
 /// Ordinary calls, binary operations, indexing, and fields do not propagate borrow roots into results.
 pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
     match unwrap_parens(e) {
         Expr::AddrOf { operand, .. } => {
-            if let Some(id) = operand.root_ident() {
+            if let Some(id) = place_root_ident(operand) {
                 if id != "_" {
                     out.push(id.to_string());
                 }
@@ -887,7 +907,7 @@ pub(crate) fn collect_addr_of_roots(e: &Expr, out: &mut Vec<String>) {
             operand,
             ..
         } => {
-            if let Some(id) = operand.root_ident() {
+            if let Some(id) = place_root_ident(operand) {
                 if id != "_" {
                     out.push(id.to_string());
                 }

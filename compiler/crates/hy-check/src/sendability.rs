@@ -396,7 +396,7 @@ impl<'a> Checker<'a> {
     }
 
     fn classify_addr_of(&self, st: &FnState, expr: &Expr, operand: &Expr) -> Outcome {
-        let Some(root) = operand.root_ident() else {
+        let Some(root) = crate::model::place_root_ident(operand) else {
             // `&m[k]`-shaped or otherwise unrooted: classify the pointee shape
             let shape = self.shape_of_expr(st, operand);
             return self.outcome_for_shape(&shape, &expr.render());
