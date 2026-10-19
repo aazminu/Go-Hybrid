@@ -130,6 +130,23 @@ impl OpKind {
             OpKind::Void => "void".to_string(),
         }
     }
+
+    fn type_arg_str(&self) -> Option<String> {
+        match self {
+            OpKind::Int => Some("int".to_string()),
+            OpKind::Float => Some("float64".to_string()),
+            OpKind::Bool => Some("bool".to_string()),
+            OpKind::Str => Some("string".to_string()),
+            OpKind::Interface => Some("any".to_string()),
+            OpKind::Slice(e) => Some(format!("[]{}", e.type_arg_str()?)),
+            OpKind::Map(k, v) => Some(format!("map[{}]{}", k.type_arg_str()?, v.type_arg_str()?)),
+            OpKind::Chan(e) => Some(format!("chan {}", e.type_arg_str()?)),
+            OpKind::Pointer(inner) => Some(format!("*{}", inner.type_arg_str()?)),
+            OpKind::Struct(Some(n)) => Some(n.clone()),
+            OpKind::TypeParam { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Does a value of kind `got` fail to satisfy a declared type of kind `want`,
@@ -1047,6 +1064,7 @@ impl<'a> Collector<'a> {
                     }
                     _ => {}
                 }
+                self.check_task_generic_call(callee, args, *span);
             }
             Stmt::Managed { body, .. } => self.block_scoped(body),
             Stmt::Match { subject, arms, .. } => {
@@ -1532,22 +1550,41 @@ impl<'a> Collector<'a> {
     }
 
     fn check_map_key_type_param(&mut self, key: &TypeExpr, span: Span) {
-        if let OpKind::TypeParam {
-            name: tp_name,
-            comparable: false,
-        } = self.kind_of_ty(key, 0)
-        {
+        let key_kind = self.kind_of_ty(key, 0);
+        if let Some(tp_name) = self.non_comparable_type_param_in_kind(&key_kind, &mut Vec::new()) {
             self.emit_e1002(
                 span,
                 format!(
                     "type parameter `{}` is constrained by `any`, not `comparable`, and cannot be used as a map key (SPEC G3) — Go refuses `incomparable map key type {}` (HYB-E1002)",
-                    tp_name, tp_name
+                    tp_name,
+                    key.render()
                 ),
                 &format!(
                     "change `[{} any]` to `[{} comparable]` (or omit `any` so the compiler infers `comparable`)",
                     tp_name, tp_name
                 ),
             );
+        }
+    }
+
+    fn check_task_generic_call(&mut self, callee: &Expr, args: &[CallArg], span: Span) {
+        let bare = unwrap_parens(callee);
+        match bare {
+            Expr::Ident { name, .. } if self.lookup_kind(name).is_none() => {
+                self.check_fn_type_arg_arity(name, name, span);
+                self.check_generic_fn_call(name, name, args, span);
+            }
+            Expr::Field { base, name, .. } => {
+                if let Expr::Ident { name: pkg, .. } = unwrap_parens(base) {
+                    if self.lookup_kind(pkg).is_none() {
+                        let head = Checker::base_named_type_str(name);
+                        let assoc_key = format!("{}.{}", pkg, head);
+                        self.check_fn_type_arg_arity(&assoc_key, name, span);
+                        self.check_generic_fn_call(&assoc_key, name, args, span);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4299,7 +4336,8 @@ impl<'a> Collector<'a> {
     }
 
     /// Issue #729 (SPEC G3/G5): verify that explicit or inferred type arguments
-    /// at a generic function call site satisfy `comparable` constraints.
+    /// at a generic function call site satisfy `comparable` constraints and that
+    /// call arguments are compatible with the instantiated parameter types.
     fn check_generic_fn_call(
         &mut self,
         fn_key: &str,
@@ -4314,6 +4352,34 @@ impl<'a> Collector<'a> {
         if f.type_params.is_empty() {
             return;
         }
+        if self.multi_value_arg_count(args).is_none() && f.params.len() != args.len() {
+            let (want, got) = (f.params.len(), args.len());
+            let msg = if got < want {
+                format!(
+                    "`{}` takes {} argument{} but is called with {} — Go refuses `not enough arguments in call to {}` (HYB-E1002)",
+                    raw_callee,
+                    want,
+                    if want == 1 { "" } else { "s" },
+                    got,
+                    base_key
+                )
+            } else {
+                format!(
+                    "`{}` takes {} argument{} but is called with {} — Go refuses `too many arguments in call to {}` (HYB-E1002)",
+                    raw_callee,
+                    want,
+                    if want == 1 { "" } else { "s" },
+                    got,
+                    base_key
+                )
+            };
+            self.emit_e1002(
+                span,
+                msg,
+                "a call must pass one argument per declared parameter; the emitted Go call is rejected at build time",
+            );
+            return;
+        }
         let constraints = Self::resolve_type_params_list(
             &f.type_params,
             f.params
@@ -4323,11 +4389,11 @@ impl<'a> Collector<'a> {
             f.body.as_ref(),
         );
         let inferred = self.infer_fn_call_type_args(&f, raw_callee, args);
-        for (tp_name, is_comp) in constraints {
-            if !is_comp {
+        for (tp_name, is_comp) in &constraints {
+            if !*is_comp {
                 continue;
             }
-            let Some(arg_kind) = inferred.get(&tp_name) else {
+            let Some(arg_kind) = inferred.get(tp_name) else {
                 continue;
             };
             if let Some(reason) = self.incomparable_kind_reason(arg_kind, &mut Vec::new()) {
@@ -4343,6 +4409,35 @@ impl<'a> Collector<'a> {
                     ),
                     "type parameters constrained by `comparable` cannot be instantiated with slices, maps, functions, `any`-constrained type parameters, or structs/arrays containing them",
                 );
+            }
+        }
+        if self.multi_value_arg_count(args).is_none() {
+            let mut subst = inferred;
+            for tp in &f.type_params {
+                subst.entry(tp.name.clone()).or_insert(OpKind::Unknown);
+            }
+            for (param, arg) in f.params.iter().zip(args.iter()) {
+                if arg.spread {
+                    continue;
+                }
+                let want = self.kind_of_ty_with_kind_subst(&param.ty, &subst, 0);
+                let got = self.kind_of_expr(&arg.value);
+                if kinds_conflict(&want, &got) {
+                    self.emit_e1002(
+                        arg.value.span(),
+                        format!(
+                            "cannot use `{}` (type `{}`) as `{}` value in argument `{}` to `{}` — Go refuses `cannot use ... as {} value in argument to {}` (HYB-E1002)",
+                            arg.value.render(),
+                            got.label(),
+                            want.label(),
+                            param.name,
+                            base_key,
+                            want.label(),
+                            base_key
+                        ),
+                        "all arguments bound to the same type parameter must unify to compatible types and match any explicit type arguments",
+                    );
+                }
             }
         }
     }
@@ -4461,6 +4556,27 @@ impl<'a> Collector<'a> {
                 let name = name.trim();
                 if let Some(k) = subst.get(name) {
                     return k.clone();
+                }
+                if let Some(open) = name.find('[') {
+                    if name.ends_with(']') {
+                        let base = &name[..open];
+                        let inner = &name[open + 1..name.len() - 1];
+                        let args = split_top_level_type_args(inner);
+                        let mut rendered_args = Vec::with_capacity(args.len());
+                        for a in args {
+                            let a = a.trim();
+                            if let Some(k) = subst.get(a) {
+                                let Some(s) = k.type_arg_str() else {
+                                    return OpKind::Unknown;
+                                };
+                                rendered_args.push(s);
+                            } else {
+                                rendered_args.push(a.to_string());
+                            }
+                        }
+                        let substituted = format!("{}[{}]", base, rendered_args.join(", "));
+                        return self.kind_of_named(&substituted, depth);
+                    }
                 }
                 self.kind_of_named(name, depth)
             }
@@ -5046,6 +5162,25 @@ impl<'a> Checker<'a> {
     }
 }
 
+fn collect_map_key_type_params<'a>(
+    key: &'a TypeExpr,
+    param_names: &HashSet<&'a str>,
+    out: &mut HashSet<String>,
+) {
+    match key {
+        TypeExpr::Named { name, .. } => {
+            let name = name.trim();
+            if param_names.contains(name) {
+                out.insert(name.to_string());
+            }
+        }
+        TypeExpr::Array { elem, .. } => {
+            collect_map_key_type_params(elem, param_names, out);
+        }
+        _ => {}
+    }
+}
+
 fn collect_comparable_type_params<'a>(
     ty: &'a TypeExpr,
     param_names: &HashSet<&'a str>,
@@ -5053,11 +5188,7 @@ fn collect_comparable_type_params<'a>(
 ) {
     match ty {
         TypeExpr::Map { key, value, .. } => {
-            if let TypeExpr::Named { name, .. } = key.as_ref() {
-                if param_names.contains(name.as_str()) {
-                    out.insert(name.clone());
-                }
-            }
+            collect_map_key_type_params(key, param_names, out);
             collect_comparable_type_params(key, param_names, out);
             collect_comparable_type_params(value, param_names, out);
         }
@@ -5540,6 +5671,15 @@ fn main() {
             // 10. Comparing a `comparable` type parameter to `nil` or `int`
             "fn bad_nil[t comparable](a t) bool { return a == nil }\nfn main() { fmt.println(bad_nil(1)) }\n",
             "fn bad_int[t comparable](a t) bool { return a == 1 }\nfn main() { fmt.println(bad_int(1)) }\n",
+            // 11. Mismatched or incomparable later argument on a generic call (`same(1, xs)`, `same[int](xs, xs)`, `same(1, \"hello\")`)
+            "fn same[t comparable](a t, b t) bool { return a == b }\nfn main() {\n    xs := []int{1}\n    fmt.println(same(1, xs))\n}\n",
+            "fn same[t comparable](a t, b t) bool { return a == b }\nfn main() {\n    xs := []int{1}\n    fmt.println(same[int](xs, xs))\n}\n",
+            "fn same[t comparable](a t, b t) bool { return a == b }\nfn main() {\n    fmt.println(same(1, \"hello\"))\n}\n",
+            // 12. Composite map key containing an `any`-constrained type parameter
+            "fn bad_arr_key[t any](x t) {\n    m := map[[2]t]int{}\n    fmt.println(m, x)\n}\nfn main() { bad_arr_key(1) }\n",
+            "struct box[t] { v t }\nfn bad_struct_key[t any](x t) {\n    m := map[box[t]]int{}\n    fmt.println(m, x)\n}\nfn main() { bad_struct_key(1) }\n",
+            // 13. `task` statement calling a `comparable` generic fn with a slice
+            "fn same[t comparable](a t, b t) {\n    if a == b { fmt.println(1) }\n}\nfn main() {\n    xs := []int{1}\n    managed {\n        task same(xs, xs)\n    }\n}\n",
         ] {
             let r = check(src);
             assert_eq!(r.verdict, Verdict::Reject, "expected reject for:\n{src}");
@@ -5554,6 +5694,10 @@ fn main() {
     #[test]
     fn accepts_g3_type_param_controls_729() {
         let src = "\
+struct box[t] {
+    v t
+}
+
 struct cache[k comparable, v any] {
     entries map[k]v
     order   []k
@@ -5568,6 +5712,10 @@ fn (c *cache[k, v]) has(key k) bool {
     return false
 }
 
+fn wrap[t](x t) box[t] {
+    return box[t]{ v: x }
+}
+
 fn same[t comparable](a t, b t) bool {
     return a == b
 }
@@ -5580,7 +5728,9 @@ fn main() {
     var c cache[string, int]
     c.entries = map[string]int{\"a\": 1}
     c.order = []string{\"a\"}
-    fmt.println(c.has(\"a\"), same(1, 2), forward_same(\"x\", \"x\"))
+    var b box[int]
+    b = wrap(42)
+    fmt.println(c.has(\"a\"), same(1, 2), forward_same(\"x\", \"x\"), b.v)
 }
 ";
         let r = check(src);
