@@ -840,6 +840,7 @@ impl<'a> Checker<'a> {
                         walk::ScopeEvent::MatchBind { name, subject } => {
                             let mut sroots = Vec::new();
                             collect_ref_roots(subject, &mut sroots);
+                            collect_move_ident_sources(subject, &mut sroots);
                             if sroots.iter().any(|r| alias_stack.last().unwrap().contains(r)) {
                                 alias_stack.last_mut().unwrap().insert(name.to_string());
                             }
@@ -900,6 +901,7 @@ impl<'a> Checker<'a> {
                         locals_stack.last_mut().unwrap().insert(name.clone());
                         let mut roots = Vec::new();
                         collect_ref_roots(val, &mut roots);
+                        collect_move_ident_sources(val, &mut roots);
                         if roots.iter().any(|r| pre_aliases.contains(r)) {
                             alias_stack.last_mut().unwrap().insert(name.clone());
                         } else {
@@ -912,6 +914,7 @@ impl<'a> Checker<'a> {
                         if let PlaceKind::Ident(name) = &t.kind {
                             let mut roots = Vec::new();
                             collect_ref_roots(val, &mut roots);
+                            collect_move_ident_sources(val, &mut roots);
                             if roots.iter().any(|r| pre_aliases.contains(r)) {
                                 alias_stack.last_mut().unwrap().insert(name.clone());
                             } else {
@@ -977,6 +980,7 @@ impl<'a> Checker<'a> {
         let arg_root_is_param = |a: &hy_syntax::CallArg| {
             let mut roots = Vec::new();
             collect_ref_roots(&a.value, &mut roots);
+            collect_move_ident_sources(&a.value, &mut roots);
             roots.iter().any(|r| r == param)
         };
         match cr.callee {
@@ -1023,7 +1027,11 @@ impl<'a> Checker<'a> {
     /// body may mutate — consumed at the closure's call sites (#111 form 4).
     /// The closure's own params are excluded: they are fresh bindings.
     pub(crate) fn record_closure_mutations(&self, st: &mut FnState, name: &str, value: &Expr) {
-        match unwrap_parens(value) {
+        let mut inner = unwrap_parens(value);
+        while let Expr::Move { operand, .. } = inner {
+            inner = unwrap_parens(operand);
+        }
+        match inner {
             Expr::FnLit {
                 params,
                 results,
@@ -1099,6 +1107,12 @@ impl<'a> Checker<'a> {
                 if !matches!(self.shape_of_expr(st, value), TypeShape::Closure) {
                     return;
                 }
+                if let Expr::Ident { name: fn_name, .. } = unwrap_parens(callee) {
+                    if (fn_name == "some" || fn_name == "ok") && args.len() == 1 {
+                        self.record_closure_mutations(st, name, &args[0].value);
+                        return;
+                    }
+                }
                 let mut mutated_roots = HashSet::new();
                 if let Expr::Ident { name: fn_name, .. } = unwrap_parens(callee) {
                     if let Some(decl) = self.fns.get(fn_name) {
@@ -1110,6 +1124,7 @@ impl<'a> Checker<'a> {
                             if mutates {
                                 let mut r = Vec::new();
                                 collect_ref_roots(&a.value, &mut r);
+                                collect_move_ident_sources(&a.value, &mut r);
                                 mutated_roots.extend(r);
                             }
                         }
@@ -1182,6 +1197,7 @@ impl<'a> Checker<'a> {
                         walk::ScopeEvent::MatchBind { name, subject } => {
                             let mut sroots = Vec::new();
                             collect_ref_roots(subject, &mut sroots);
+                            collect_move_ident_sources(subject, &mut sroots);
                             sroots.retain(|r| !bound.contains(r));
                             let current_shadows = shadow_stack.last().unwrap();
                             let current_aliases = alias_stack.last().unwrap();
@@ -1210,6 +1226,7 @@ impl<'a> Checker<'a> {
                         current_locals.insert(name.clone());
                         let mut roots = Vec::new();
                         collect_ref_roots(val, &mut roots);
+                        collect_move_ident_sources(val, &mut roots);
                         let resolved = roots.iter().find_map(|p| resolve(p, &pre_aliases, &pre_shadows));
                         if let Some(r) = resolved {
                             current_shadows.remove(name.as_str());
@@ -1227,6 +1244,7 @@ impl<'a> Checker<'a> {
                         if let PlaceKind::Ident(name) = &t.kind {
                             let mut roots = Vec::new();
                             collect_ref_roots(val, &mut roots);
+                            collect_move_ident_sources(val, &mut roots);
                             let resolved = roots.iter().find_map(|p| resolve(p, &pre_aliases, &pre_shadows));
                             if let Some(r) = resolved {
                                 current_shadows.remove(name.as_str());
@@ -1241,6 +1259,7 @@ impl<'a> Checker<'a> {
                 Stmt::Match { subject, arms, .. } => {
                     let mut sroots = Vec::new();
                     collect_ref_roots(subject, &mut sroots);
+                    collect_move_ident_sources(subject, &mut sroots);
                     sroots.retain(|r| !bound.contains(r));
                     for arm in arms {
                         if let hy_syntax::MatchPattern::Path {
@@ -1277,12 +1296,16 @@ impl<'a> Checker<'a> {
                 _ => {}
             }
             for v in fnlit_values {
+                let mut inner_v = unwrap_parens(v);
+                while let Expr::Move { operand, .. } = inner_v {
+                    inner_v = unwrap_parens(operand);
+                }
                 if let Expr::FnLit {
                     params: fp,
                     results: fr,
                     body: fb,
                     ..
-                } = unwrap_parens(v)
+                } = inner_v
                 {
                     let mut inner_bound: HashSet<String> =
                         fp.iter().map(|p| p.name.clone()).collect();
@@ -1304,6 +1327,7 @@ impl<'a> Checker<'a> {
                             if let Some(first) = cr.args.first() {
                                 let mut roots = Vec::new();
                                 collect_ref_roots(&first.value, &mut roots);
+                                collect_move_ident_sources(&first.value, &mut roots);
                                 for root in roots {
                                     if let Some(r) =
                                         resolve(&root, current_aliases, current_shadows)
@@ -1321,6 +1345,7 @@ impl<'a> Checker<'a> {
                             for (i, a) in cr.args.iter().enumerate() {
                                 let mut roots = Vec::new();
                                 collect_ref_roots(&a.value, &mut roots);
+                                collect_move_ident_sources(&a.value, &mut roots);
                                 for root in roots {
                                     let Some(r) =
                                         resolve(&root, current_aliases, current_shadows)
@@ -1344,6 +1369,7 @@ impl<'a> Checker<'a> {
                             for a in cr.args {
                                 let mut roots = Vec::new();
                                 collect_ref_roots(&a.value, &mut roots);
+                                collect_move_ident_sources(&a.value, &mut roots);
                                 for root in roots {
                                     if let Some(r) =
                                         resolve(&root, current_aliases, current_shadows)
@@ -1363,6 +1389,7 @@ impl<'a> Checker<'a> {
                         for a in cr.args {
                             let mut roots = Vec::new();
                             collect_ref_roots(&a.value, &mut roots);
+                            collect_move_ident_sources(&a.value, &mut roots);
                             for root in roots {
                                 if let Some(r) =
                                     resolve(&root, current_aliases, current_shadows)
@@ -1376,6 +1403,7 @@ impl<'a> Checker<'a> {
                         for a in cr.args {
                             let mut roots = Vec::new();
                             collect_ref_roots(&a.value, &mut roots);
+                            collect_move_ident_sources(&a.value, &mut roots);
                             for root in roots {
                                 if let Some(r) =
                                     resolve(&root, current_aliases, current_shadows)
@@ -1709,6 +1737,7 @@ impl<'a> Checker<'a> {
                 if move_operand_ident(value).is_some()
                     || matches!(unwrap_parens(value), Expr::Move { .. })
                 {
+                    let is_view = matches!(shape, TypeShape::BorrowHandle(_));
                     self.define_binding(st, name, shape, ty, immutable, managed, is_let);
                     if let Some(origin) = moved_non_owned {
                         if let Some(b) = st.env_lookup_mut(name) {
@@ -1716,6 +1745,10 @@ impl<'a> Checker<'a> {
                         }
                     }
                     self.record_move_const_and_a3_loans(st, name, value, idx);
+                    if is_view {
+                        self.extend_call_loans_to_view(st, value, name, idx);
+                    }
+                    self.record_closure_mutations(st, name, value);
                     continue;
                 }
                 // Self-shadowing define (`m := m`, `h := h`, `m := same(m)`
@@ -2748,6 +2781,7 @@ impl<'a> Checker<'a> {
                 CalleeSlotSource::Arg(dst_expr) => {
                     collect_ref_roots(dst_expr, &mut dst_roots);
                     collect_addr_of_roots(dst_expr, &mut dst_roots);
+                    collect_move_ident_sources(dst_expr, &mut dst_roots);
                 }
                 CalleeSlotSource::OuterBinding(name) => {
                     dst_roots.push(name.clone());
@@ -2759,6 +2793,7 @@ impl<'a> Checker<'a> {
                 CalleeSlotSource::Arg(src_expr) => {
                     collect_ref_roots(src_expr, &mut src_roots);
                     collect_addr_of_roots(src_expr, &mut src_roots);
+                    collect_move_ident_sources(src_expr, &mut src_roots);
                     let mut move_ops = Vec::new();
                     crate::model::collect_move_operands(src_expr, &mut move_ops);
                     for (op, _) in move_ops {
@@ -3087,6 +3122,7 @@ impl<'a> Checker<'a> {
         let inner = crate::model::unwrap_parens(expr);
         collect_ref_roots(inner, &mut roots);
         collect_addr_of_roots(inner, &mut roots);
+        collect_move_ident_sources(inner, &mut roots);
         let mut move_ops = Vec::new();
         crate::model::collect_move_operands(inner, &mut move_ops);
         for (op, _) in move_ops {
@@ -3908,13 +3944,16 @@ impl<'a> Checker<'a> {
         }
         for loan in st.loans.iter_mut() {
             if let LoanTarget::Handle { handle } = &loan.target {
-                if loan.created == idx && loan.last == idx && roots.iter().any(|r| r == handle) {
-                    loan.last = view_last;
+                if (idx == 0 || (loan.created == idx && loan.last == idx))
+                    && roots.iter().any(|r| r == handle)
+                {
+                    loan.last = loan.last.max(view_last);
                 }
             }
         }
         let mut ref_roots = Vec::new();
         collect_ref_roots(value, &mut ref_roots);
+        collect_move_ident_sources(value, &mut ref_roots);
         for src in ref_roots {
             if src == name {
                 continue;
@@ -3925,15 +3964,21 @@ impl<'a> Checker<'a> {
                 .unwrap_or(false);
             if is_borrow_src {
                 let group = st.share_group(&src);
+                let mut extended_handles = Vec::new();
                 for loan in st.loans.iter_mut() {
                     if let LoanTarget::Handle { handle } = &loan.target {
-                        if loan.created <= idx
-                            && idx <= loan.last
+                        if (idx == 0 || (loan.created <= idx && idx <= loan.last))
                             && (handle == &src || group.contains(handle))
                         {
                             loan.last = loan.last.max(view_last);
+                            if handle != &src && handle != name {
+                                extended_handles.push(handle.clone());
+                            }
                         }
                     }
+                }
+                for h in extended_handles {
+                    st.share_edge(name, &h);
                 }
             }
         }
@@ -4381,6 +4426,7 @@ impl<'a> Checker<'a> {
                      -> HashSet<String> {
                         let mut roots = Vec::new();
                         collect_ref_roots(e, &mut roots);
+                        collect_move_ident_sources(e, &mut roots);
                         self.collect_callee_const_return_roots(st, e, &mut roots, depth + 1);
                         let mut set = HashSet::new();
                         for r in roots {
@@ -4647,6 +4693,7 @@ impl<'a> Checker<'a> {
                         );
                         let mut dst_roots = Vec::new();
                         collect_ref_roots(&cr.args[0].value, &mut dst_roots);
+                        collect_move_ident_sources(&cr.args[0].value, &mut dst_roots);
                         for dr in dst_roots {
                             if !src_o.is_empty() {
                                 origins.entry(dr).or_default().extend(src_o.iter().cloned());
@@ -4683,6 +4730,7 @@ impl<'a> Checker<'a> {
                                 match dst_src {
                                     CalleeSlotSource::Arg(dst_e) => {
                                         collect_ref_roots(dst_e, &mut dst_roots);
+                                        collect_move_ident_sources(dst_e, &mut dst_roots);
                                         collect_addr_of_roots(dst_e, &mut dst_roots);
                                     }
                                     CalleeSlotSource::OuterBinding(bname) => {
@@ -5247,7 +5295,11 @@ impl<'a> Checker<'a> {
 
         self.record_may_share(st, name, subject);
         self.record_move_const_and_a3_loans(st, name, subject, 0);
+        if matches!(shape, TypeShape::BorrowHandle(_)) {
+            self.extend_call_loans_to_view(st, subject, name, 0);
+        }
         self.record_alias(st, name, subject);
+        self.record_closure_mutations(st, name, subject);
 
         for peer in &pre_share_peers {
             if peer != name {

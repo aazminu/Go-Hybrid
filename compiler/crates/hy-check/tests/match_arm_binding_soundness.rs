@@ -605,3 +605,133 @@ fn main() {
     assert!(error_codes(&r).is_empty(), "{:?}", r.diagnostics);
 }
 
+#[test]
+fn interprocedural_and_closure_slot_loan_invalidation_via_move_is_e3102() {
+    let src = "\
+import \"fmt\"
+
+fn mutate_via_move_alias(x map[string]int) {
+    y := move x
+    y[\"b\"] = 2
+}
+
+fn delete_via_move_param(x map[string]int) {
+    delete(move x, \"a\")
+}
+
+fn main(cb fn(x map[string]int)) {
+    m1 := map[string]int{\"a\": 1}
+    p1 := &m1[\"a\"]
+    mutate_via_move_alias(m1)
+    fmt.println(p1)
+
+    m2 := map[string]int{\"a\": 1}
+    p2 := &m2[\"a\"]
+    delete_via_move_param(m2)
+    fmt.println(p2)
+
+    m3 := map[string]int{\"a\": 1}
+    p3 := &m3[\"a\"]
+    f := fn() {
+        delete(move m3, \"a\")
+    }
+    f2 := move f
+    f2()
+    fmt.println(p3)
+
+    m4 := map[string]int{\"a\": 1}
+    p4 := &m4[\"a\"]
+    cb(move m4)
+    fmt.println(p4)
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3102").count() >= 4,
+        "expected at least 4 HYB-E3102 diagnostics, got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn borrow_handle_view_loan_extended_across_move_and_match_is_e3101() {
+    let src = "\
+import \"fmt\"
+import \"rust/serde_json\"
+
+fn main() {
+    doc := serde_json.parse(`{}`)?
+    u := doc.array(\"users\")?
+    match some(u) {
+        some(u2) => {
+            doc.set(\"k\", 1)?
+            fmt.println(u2.len())
+        }
+        none => {}
+    }
+
+    doc2 := serde_json.parse(`{}`)?
+    match some(doc2.array(\"users\")?) {
+        some(u4) => {
+            doc2.set(\"k\", 1)?
+            fmt.println(u4.len())
+        }
+        none => {}
+    }
+
+    doc3 := serde_json.parse(`{}`)?
+    u5 := move (doc3.array(\"users\")?)
+    doc3.set(\"k\", 1)?
+    fmt.println(u5.len())
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3101").count() >= 3,
+        "expected at least 3 HYB-E3101 diagnostics, got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn interprocedural_out_param_store_with_move_arg_preserves_sharing_provenance() {
+    let src = "\
+import \"fmt\"
+
+fn store_into(d [][]int, s []int) {
+    d[0] = s
+}
+
+fn bad_use_after_move() {
+    ch := make(chan []int, 1)
+    dst := make([][]int, 1)
+    src := []int{1, 2, 3}
+    store_into(move dst, src)
+    ch <- move src
+    fmt.println(dst)
+}
+
+fn bad_non_owned_param(s []int, ch chan [][]int) {
+    dst := make([][]int, 1)
+    store_into(move dst, s)
+    ch <- move dst
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.contains(&"HYB-E3003".to_string()),
+        "expected HYB-E3003 for bad_use_after_move, got {:?}",
+        r.diagnostics
+    );
+    assert!(
+        codes.contains(&"HYB-E3004".to_string()),
+        "expected HYB-E3004 for bad_non_owned_param, got {:?}",
+        r.diagnostics
+    );
+}
