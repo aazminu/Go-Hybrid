@@ -168,7 +168,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -200,7 +200,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -227,7 +227,7 @@ impl<'a> Checker<'a> {
                     return false;
                 }
                 seen.push(sname.clone());
-                let Some(fields) = self.structs.get(sname) else {
+                let Some(fields) = self.struct_fields_for_sname(sname) else {
                     return false;
                 };
                 fields
@@ -638,11 +638,26 @@ impl<'a> Checker<'a> {
                 if self.lookup_binding(st, name).is_some() {
                     return None; // shadowed by a local binding — not a static fn call
                 }
-                let f = self.fns.get(name)?;
+                let head = Self::base_named_type_str(name);
+                let f = self.fns.get(name.as_str()).or_else(|| self.fns.get(head))?;
                 if f.params.len() != argc {
                     return None;
                 }
-                Some(f.params.iter().map(|p| self.shape_of_type(&p.ty)).collect())
+                let mut subst = std::collections::HashMap::new();
+                if let Some((_, explicit_args)) = Self::parse_generic_type_args(name) {
+                    for (tp, arg) in f.type_params.iter().zip(explicit_args.iter()) {
+                        subst.insert(tp.name.clone(), arg.clone());
+                    }
+                }
+                Some(
+                    f.params
+                        .iter()
+                        .map(|p| {
+                            let pty = Self::substitute_type_params(&p.ty, &subst);
+                            self.shape_of_type(&pty)
+                        })
+                        .collect(),
+                )
             }
             Expr::FnLit { params, .. } => {
                 if params.len() != argc {
@@ -656,15 +671,18 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 let recv_base = match self.shape_of_expr(st, base) {
-                    TypeShape::Struct(Some(s)) => Some(s),
+                    TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(&s).to_string()),
                     TypeShape::Pointer(inner) => match *inner {
-                        TypeShape::Struct(Some(s)) => Some(s),
+                        TypeShape::Struct(Some(s)) => {
+                            Some(Self::base_named_type_str(&s).to_string())
+                        }
                         _ => None,
                     },
                     _ => None,
                 };
+                let head = Self::base_named_type_str(method_name);
                 let f = recv_base.and_then(|rb| {
-                    self.method_decls.get(&(rb, method_name.clone())).copied()
+                    self.method_decls.get(&(rb, head.to_string())).copied()
                 })?;
                 if f.params.len() != argc {
                     return None;
@@ -687,7 +705,11 @@ impl<'a> Checker<'a> {
             (Struct(None), _) | (_, Struct(None)) => true,
             (ForeignOpaque(_), _) | (_, ForeignOpaque(_)) => true,
             (Primitive, Primitive) | (Str, Str) | (Atomic, Atomic) => true,
-            (Struct(Some(a)), Struct(Some(b))) => a == b,
+            (Struct(Some(a)), Struct(Some(b))) => {
+                a == b
+                    || (Self::base_named_type_str(a) == Self::base_named_type_str(b)
+                        && (!a.contains('[') || !b.contains('[')))
+            }
             (Map(_, _), Map(_, _)) => true,
             (Slice(_), Slice(_)) | (Array(_), Array(_)) => true,
             // Go converts between slice and array of the same element class
@@ -1011,7 +1033,8 @@ impl<'a> Checker<'a> {
                         _ => None,
                     }
                 }) {
-                    if let Some(def) = self.structs.get(&sname).cloned() {
+                    if let Some(def) = self.struct_fields_for_sname(&sname) {
+                        let base_sname = Self::base_named_type_str(&sname);
                         for f in fields {
                             if let Some((_, fty)) = def.iter().find(|(n, _)| n == &f.name) {
                                 if Checker::is_nil_literal(&f.value) {
@@ -1021,7 +1044,7 @@ impl<'a> Checker<'a> {
                                             &fshape,
                                             fty.render(),
                                             f.value.span(),
-                                            &format!("the field `{}.{}`", sname, f.name),
+                                            &format!("the field `{}.{}`", base_sname, f.name),
                                         );
                                     }
                                     continue;
@@ -2184,7 +2207,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn parse_generic_type_args(name: &str) -> Option<(&str, Vec<hy_syntax::TypeExpr>)> {
+    pub(crate) fn parse_generic_type_args(name: &str) -> Option<(&str, Vec<hy_syntax::TypeExpr>)> {
         let open = name.find('[')?;
         if !name.ends_with(']') || open == 0 {
             return None;
@@ -2225,7 +2248,7 @@ impl<'a> Checker<'a> {
         Some((base, parsed))
     }
 
-    fn substitute_type_params(
+    pub(crate) fn substitute_type_params(
         ty: &hy_syntax::TypeExpr,
         subst: &std::collections::HashMap<String, hy_syntax::TypeExpr>,
     ) -> hy_syntax::TypeExpr {
@@ -2300,7 +2323,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn peel_pointer_and_alias(&self, ty: &hy_syntax::TypeExpr) -> hy_syntax::TypeExpr {
+    pub(crate) fn peel_pointer_and_alias(&self, ty: &hy_syntax::TypeExpr) -> hy_syntax::TypeExpr {
         let mut cur = self.resolve_type_alias(ty);
         while let hy_syntax::TypeExpr::Pointer { to, .. } = cur {
             cur = self.resolve_type_alias(&to);
@@ -2308,23 +2331,28 @@ impl<'a> Checker<'a> {
         cur
     }
 
-    fn struct_fields_for_type(
+    pub(crate) fn struct_fields_for_sname(
         &self,
-        ty: &hy_syntax::TypeExpr,
+        raw_name: &str,
     ) -> Option<Vec<(String, hy_syntax::TypeExpr)>> {
-        let peeled = self.peel_pointer_and_alias(ty);
-        let hy_syntax::TypeExpr::Named { name, .. } = &peeled else {
-            return None;
-        };
-        let sname = Self::base_named_type_str(name);
+        let mut cur = raw_name.trim().to_string();
+        for _ in 0..8 {
+            if let Some(hy_syntax::TypeExpr::Named { name, .. }) =
+                self.type_aliases.get(cur.as_str())
+            {
+                if name != &cur {
+                    cur = name.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        let sname = Self::base_named_type_str(&cur);
         let fields = self.structs.get(sname)?.clone();
-        if let Some((_, type_args)) = Self::parse_generic_type_args(name) {
-            if let Some(sdecl) = self.file.decls.iter().find_map(|d| match d {
-                hy_syntax::Decl::Struct(s) if s.name == sname => Some(s),
-                _ => None,
-            }) {
+        if let Some((_, type_args)) = Self::parse_generic_type_args(&cur) {
+            if let Some(tparams) = self.struct_type_params.get(sname) {
                 let mut subst = std::collections::HashMap::new();
-                for (tp, arg) in sdecl.type_params.iter().zip(type_args.iter()) {
+                for (tp, arg) in tparams.iter().zip(type_args.iter()) {
                     subst.insert(tp.name.clone(), arg.clone());
                 }
                 if !subst.is_empty() {
@@ -2338,6 +2366,74 @@ impl<'a> Checker<'a> {
             }
         }
         Some(fields)
+    }
+
+    pub(crate) fn struct_fields_for_type(
+        &self,
+        ty: &hy_syntax::TypeExpr,
+    ) -> Option<Vec<(String, hy_syntax::TypeExpr)>> {
+        let peeled = self.peel_pointer_and_alias(ty);
+        let hy_syntax::TypeExpr::Named { name, .. } = &peeled else {
+            return None;
+        };
+        self.struct_fields_for_sname(name)
+    }
+
+    pub(crate) fn fn_subst_for_state(
+        &self,
+        st: &FnState,
+        f: &hy_syntax::FnDecl,
+        callee_name: &str,
+        receiver_ty: Option<&hy_syntax::TypeExpr>,
+        args: &[hy_syntax::CallArg],
+    ) -> std::collections::HashMap<String, hy_syntax::TypeExpr> {
+        let mut subst = std::collections::HashMap::new();
+        if let (Some(rdecl), Some(ract)) = (&f.receiver, receiver_ty) {
+            let rdecl_peeled = self.peel_pointer_and_alias(&rdecl.ty);
+            let ract_peeled = self.peel_pointer_and_alias(ract);
+            if let (
+                hy_syntax::TypeExpr::Named { name: dn, .. },
+                hy_syntax::TypeExpr::Named { name: an, .. },
+            ) = (&rdecl_peeled, &ract_peeled)
+            {
+                if let (Some((db, dargs)), Some((ab, aargs))) = (
+                    Self::parse_generic_type_args(dn),
+                    Self::parse_generic_type_args(an),
+                ) {
+                    if db == ab {
+                        for (darg, aarg) in dargs.iter().zip(aargs.iter()) {
+                            if let hy_syntax::TypeExpr::Named { name: tp_name, .. } = darg {
+                                subst.insert(tp_name.clone(), aarg.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, explicit_args)) = Self::parse_generic_type_args(callee_name) {
+            for (tp, arg) in f.type_params.iter().zip(explicit_args.iter()) {
+                subst.insert(tp.name.clone(), arg.clone());
+            }
+        } else if !f.type_params.is_empty() {
+            let tp_names: std::collections::HashSet<String> =
+                f.type_params.iter().map(|tp| tp.name.clone()).collect();
+            for (i, arg) in args.iter().enumerate() {
+                let param = if let Some(aname) = &arg.name {
+                    f.params
+                        .iter()
+                        .find(|p| &p.name == aname)
+                        .or_else(|| f.params.get(i))
+                } else {
+                    f.params.get(i)
+                };
+                if let Some(p) = param {
+                    if let Some(arg_ty) = self.ty_of_expr(st, &arg.value) {
+                        self.infer_type_param_bindings(&p.ty, &arg_ty, &tp_names, &mut subst);
+                    }
+                }
+            }
+        }
+        subst
     }
 
     fn infer_type_param_bindings(

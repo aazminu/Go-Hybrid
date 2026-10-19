@@ -459,7 +459,7 @@ impl<'a> Checker<'a> {
                     {
                         sname = target.clone();
                     }
-                    if let Some(struct_fields) = self.structs.get(&sname).cloned() {
+                    if let Some(struct_fields) = self.struct_fields_for_sname(&sname) {
                         for f in fields {
                             if let Some((_, f_ty)) =
                                 struct_fields.iter().find(|(fname, _)| fname == &f.name)
@@ -798,8 +798,8 @@ impl<'a> Checker<'a> {
                     return None; // value cycle — Go rejects the type itself elsewhere
                 }
                 seen.push(name.clone());
-                let fields = self.structs.get(name)?;
-                for (_, ft) in fields {
+                let fields = self.struct_fields_for_sname(name)?;
+                for (_, ft) in &fields {
                     let fs = self.shape_of_type(ft);
                     if let Some(n) = self.incomparable_rec(&fs, seen) {
                         return Some(n);

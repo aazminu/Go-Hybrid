@@ -594,7 +594,11 @@ impl<'a> Checker<'a> {
                 if !live.iter().any(|p| a3_paths_conflict(st, p, &arg_path)) {
                     continue;
                 }
-                let Some(decl) = self.fns.get(name) else {
+                let Some(decl) = self
+                    .fns
+                    .get(name)
+                    .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                else {
                     continue;
                 };
                 match decl.params.get(i) {
@@ -672,18 +676,19 @@ impl<'a> Checker<'a> {
             return;
         }
         let recv_sname = match recv {
-            TypeShape::Struct(Some(s)) => Some(s.clone()),
+            TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(s).to_string()),
             TypeShape::Pointer(inner) => match &**inner {
-                TypeShape::Struct(Some(s)) => Some(s.clone()),
+                TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(s).to_string()),
                 _ => None,
             },
             _ => None,
         };
+        let method_head = Self::base_named_type_str(method);
         let verb = format!("mutation via `{}`", cr.callee.render());
         let callee_path = walk::expr_path(cr.callee).unwrap_or_else(|| root.to_string());
         if let Some(sname) = recv_sname {
             let found_decl = self.file.decls.iter().find_map(|d| match d {
-                hy_syntax::Decl::Fn(f) if f.name == method => {
+                hy_syntax::Decl::Fn(f) if f.name == method_head => {
                     let r = f.receiver.as_ref()?;
                     let b = Self::base_named_type(&r.ty)?;
                     (b == sname).then_some(f)
@@ -985,7 +990,11 @@ impl<'a> Checker<'a> {
                 if A3_PURE_FNS.contains(&name.as_str()) {
                     return false;
                 }
-                if let Some(decl) = self.fns.get(name) {
+                if let Some(decl) = self
+                    .fns
+                    .get(name)
+                    .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                {
                     for (i, a) in cr.args.iter().enumerate() {
                         if !arg_root_is_param(a) {
                             continue;
@@ -1099,7 +1108,11 @@ impl<'a> Checker<'a> {
                 }
                 let mut mutated_roots = HashSet::new();
                 if let Expr::Ident { name: fn_name, .. } = unwrap_parens(callee) {
-                    if let Some(decl) = self.fns.get(fn_name) {
+                    if let Some(decl) = self
+                        .fns
+                        .get(fn_name)
+                        .or_else(|| self.fns.get(Self::base_named_type_str(fn_name)))
+                    {
                         for (i, a) in args.iter().enumerate() {
                             let mutates = match decl.params.get(i) {
                                 Some(p) => self.fn_mutates_param(decl, &p.name, 0),
@@ -1315,7 +1328,11 @@ impl<'a> Checker<'a> {
                         if A3_PURE_FNS.contains(&name.as_str()) {
                             continue;
                         }
-                        if let Some(decl) = self.fns.get(name) {
+                        if let Some(decl) = self
+                            .fns
+                            .get(name)
+                            .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                        {
                             for (i, a) in cr.args.iter().enumerate() {
                                 let mut roots = Vec::new();
                                 collect_ref_roots(&a.value, &mut roots);
@@ -2883,7 +2900,10 @@ impl<'a> Checker<'a> {
                     self.append_outer_binding_slots(st, &mut bound, true, &mut slots);
                     return Some((slots, std::borrow::Cow::Owned(body.clone())));
                 }
-                let decl = *self.fns.get(name.as_str())?;
+                let decl = *self
+                    .fns
+                    .get(name.as_str())
+                    .or_else(|| self.fns.get(Self::base_named_type_str(name)))?;
                 let body = decl.body.as_ref()?;
                 let mut slots = Vec::new();
                 let mut bound: HashSet<String> =
@@ -6485,17 +6505,18 @@ impl<'a> Checker<'a> {
         } = callee
         {
             let recv_base = match self.shape_of_expr(st, base) {
-                TypeShape::Struct(Some(s)) => Some(s),
+                TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(&s).to_string()),
                 TypeShape::Pointer(inner) => match *inner {
-                    TypeShape::Struct(Some(s)) => Some(s),
+                    TypeShape::Struct(Some(s)) => Some(Self::base_named_type_str(&s).to_string()),
                     _ => None,
                 },
                 _ => None,
             };
+            let method_head = Self::base_named_type_str(method_name).to_string();
             if let Some(rname) = recv_base {
                 if let Some(decl) = self
                     .method_decls
-                    .get(&(rname, method_name.clone()))
+                    .get(&(rname, method_head))
                     .copied()
                 {
                     if let Some(r) = &decl.receiver {
@@ -6560,7 +6581,11 @@ impl<'a> Checker<'a> {
                 Expr::Ident { name, .. } => {
                     if declared.contains(name) {
                         (false, true)
-                    } else if let Some(decl) = self.fns.get(name) {
+                    } else if let Some(decl) = self
+                        .fns
+                        .get(name)
+                        .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                    {
                         match decl.params.get(i) {
                             Some(p) => {
                                 let is_ptr = matches!(p.ty, hy_syntax::TypeExpr::Pointer { .. })
@@ -6611,15 +6636,20 @@ impl<'a> Checker<'a> {
                         (false, true)
                     } else {
                         let recv_base = match self.shape_of_expr(st, base) {
-                            TypeShape::Struct(Some(s)) => Some(s),
+                            TypeShape::Struct(Some(s)) => {
+                                Some(Self::base_named_type_str(&s).to_string())
+                            }
                             TypeShape::Pointer(inner) => match *inner {
-                                TypeShape::Struct(Some(s)) => Some(s),
+                                TypeShape::Struct(Some(s)) => {
+                                    Some(Self::base_named_type_str(&s).to_string())
+                                }
                                 _ => None,
                             },
                             _ => None,
                         };
+                        let method_head = Self::base_named_type_str(method_name).to_string();
                         if let Some(decl) = recv_base.and_then(|rb| {
-                            self.method_decls.get(&(rb, method_name.clone())).copied()
+                            self.method_decls.get(&(rb, method_head)).copied()
                         }) {
                             match decl.params.get(i) {
                                 Some(p) => {
@@ -6969,7 +6999,11 @@ impl<'a> Checker<'a> {
                     }
                     return;
                 }
-                if let Some(decl) = self.fns.get(name) {
+                if let Some(decl) = self
+                    .fns
+                    .get(name)
+                    .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                {
                     let Some(body) = &decl.body else {
                         return;
                     };
@@ -6997,8 +7031,9 @@ impl<'a> Checker<'a> {
                 name: method_name,
                 ..
             } => {
+                let method_head = Self::base_named_type_str(method_name);
                 for ((_, m), decl) in &self.method_decls {
-                    if m != method_name {
+                    if m != method_head {
                         continue;
                     }
                     let Some(body) = &decl.body else {
@@ -7182,7 +7217,11 @@ impl<'a> Checker<'a> {
                 if A3_PURE_FNS.contains(&name.as_str()) {
                     return false;
                 }
-                if let Some(decl) = self.fns.get(name) {
+                if let Some(decl) = self
+                    .fns
+                    .get(name)
+                    .or_else(|| self.fns.get(Self::base_named_type_str(name)))
+                {
                     for (i, a) in cr.args.iter().enumerate() {
                         if !arg_reaches_alias(a) {
                             continue;
@@ -7210,10 +7249,11 @@ impl<'a> Checker<'a> {
                         return false;
                     }
                 }
+                let method_head = Self::base_named_type_str(method_name);
                 let matching: Vec<&FnDecl> = self
                     .method_decls
                     .iter()
-                    .filter(|((_, m), _)| m == method_name)
+                    .filter(|((_, m), _)| m == method_head)
                     .map(|(_, d)| *d)
                     .collect();
                 if Self::expr_reaches_const_aliases(base, aliases)
@@ -7327,37 +7367,37 @@ impl<'a> Checker<'a> {
                 }
                 PlaceKind::Ident(name) => {
                     let b = self.lookup_binding(st, name)?;
-                    let mut cur = b.ty.as_ref()?;
+                    let mut cur = b.ty.clone()?;
                     steps.reverse();
                     for step in steps {
                         while let hy_syntax::TypeExpr::Pointer { to, .. } = cur {
-                            cur = to.as_ref();
+                            cur = *to;
                         }
                         match step {
                             Step::Index => match cur {
                                 hy_syntax::TypeExpr::Array { elem, .. }
                                 | hy_syntax::TypeExpr::Slice { elem, .. } => {
-                                    cur = elem.as_ref();
+                                    cur = *elem;
                                 }
                                 hy_syntax::TypeExpr::Map { value, .. } => {
-                                    cur = value.as_ref();
+                                    cur = *value;
                                 }
                                 _ => return None,
                             },
-                            Step::Field(field_name) => match cur {
+                            Step::Field(field_name) => match &cur {
                                 hy_syntax::TypeExpr::Named {
                                     name: struct_name, ..
                                 } => {
-                                    let fields = self.structs.get(struct_name)?;
+                                    let fields = self.struct_fields_for_sname(struct_name)?;
                                     let (_, field_ty) =
-                                        fields.iter().find(|(f, _)| f == field_name)?;
+                                        fields.into_iter().find(|(f, _)| f == field_name)?;
                                     cur = field_ty;
                                 }
                                 _ => return None,
                             },
                         }
                     }
-                    return Some(cur.clone());
+                    return Some(cur);
                 }
             }
         }
