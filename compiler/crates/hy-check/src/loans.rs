@@ -463,6 +463,7 @@ impl<'a> Checker<'a> {
                 .unwrap_or_else(|| self.shape_of_expr(st, unwrap_parens(val)).is_reference_alias());
             if is_ref {
                 collect_ref_roots(val, &mut srcs);
+                collect_move_ident_sources(val, &mut srcs);
             }
         }
         if srcs.is_empty() {
@@ -2056,12 +2057,20 @@ impl<'a> Checker<'a> {
         }
         let mut ref_roots = Vec::new();
         collect_ref_roots(inner, &mut ref_roots);
+        collect_move_ident_sources(inner, &mut ref_roots);
         ref_roots.iter().any(|r| {
+            let root = crate::freeze::resolve_alias(st, r);
             st.borrow_bindings.contains(r)
-                || st
-                    .loans
-                    .iter()
-                    .any(|l| matches!(&l.target, LoanTarget::MapSlot { binding, .. } if binding == r))
+                || st.borrow_bindings.contains(&root)
+                || self.lookup_binding(st, r).is_some_and(|b| b.slot_loan)
+                || self.lookup_binding(st, &root).is_some_and(|b| b.slot_loan)
+                || st.loans.iter().any(|l| {
+                    matches!(
+                        &l.target,
+                        LoanTarget::MapSlot { binding, .. }
+                            if binding == r || binding == &root
+                    )
+                })
         })
     }
 
@@ -7399,6 +7408,7 @@ impl<'a> Checker<'a> {
             // returns every named result binding (`st.named_results`).
             for name in st.named_results.clone() {
                 let is_loan_escape = st.borrow_bindings.contains(&name)
+                    || self.lookup_binding(st, &name).is_some_and(|b| b.slot_loan)
                     || st
                         .loans
                         .iter()
@@ -7446,6 +7456,7 @@ impl<'a> Checker<'a> {
             let is_bound_borrow = match unwrap_parens(v) {
                 Expr::Ident { name, .. } => {
                     st.borrow_bindings.contains(name)
+                        || self.lookup_binding(st, name).is_some_and(|b| b.slot_loan)
                         || st
                             .loans
                             .iter()
@@ -7482,7 +7493,7 @@ impl<'a> Checker<'a> {
 /// Collect root identifiers of `move` operands inside `expr` (including
 /// top-level `move x` and `move` expressions nested inside composite literals
 /// or call arguments).
-fn collect_move_ident_sources(expr: &Expr, out: &mut Vec<String>) {
+pub(crate) fn collect_move_ident_sources(expr: &Expr, out: &mut Vec<String>) {
     match unwrap_parens(expr) {
         Expr::Move { operand, .. } => {
             if let Some(root) = unwrap_parens(operand).root_ident() {

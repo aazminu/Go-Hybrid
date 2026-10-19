@@ -216,3 +216,137 @@ fn main() {
     assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
     assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
 }
+
+#[test]
+fn move_wrapped_and_chained_slot_loan_forwarding_preserve_a3_and_t24() {
+    for bind_stmt in [
+        "p2 := move p",
+        "p2 := id(move p)",
+        "p2 := id(id(p))",
+    ] {
+        let a3_src = format!(
+            r#"
+import "fmt"
+
+struct entry {{
+    n int
+}}
+
+fn id(p *entry) *entry {{
+    return move p
+}}
+
+fn main() {{
+    m := map[string]entry{{"a": entry{{n: 1}}}}
+    p := &m["a"]
+    {bind_stmt}
+    delete(m, "a")
+    p2.n = 9
+    fmt.println(p2.n)
+}}
+"#
+        );
+        let r_a3 = check(&a3_src);
+        assert_eq!(r_a3.verdict, Verdict::Reject, "{:?}", r_a3.diagnostics);
+        assert!(
+            error_codes(&r_a3).iter().any(|c| c == "HYB-E3102"),
+            "expected HYB-E3102 for `{bind_stmt}`, got: {:?}",
+            r_a3.diagnostics
+        );
+
+        let t24_src = format!(
+            r#"
+import "fmt"
+
+struct entry {{
+    n int
+}}
+
+fn id(p *entry) *entry {{
+    return move p
+}}
+
+fn main() {{
+    m := map[string]entry{{"a": entry{{n: 1}}}}
+    p := &m["a"]
+    {bind_stmt}
+    q := &p2
+    fmt.println(q)
+}}
+"#
+        );
+        let r_t24 = check(&t24_src);
+        assert_eq!(r_t24.verdict, Verdict::Reject, "{:?}", r_t24.diagnostics);
+        assert!(
+            error_codes(&r_t24).iter().any(|c| c == "HYB-E3104"),
+            "expected HYB-E3104 for `{bind_stmt}`, got: {:?}",
+            r_t24.diagnostics
+        );
+    }
+}
+
+#[test]
+fn closure_multi_value_unpacked_slot_loan_enforces_a3_and_t24() {
+    let a3_src = r#"
+import "fmt"
+
+struct entry {
+    n int
+}
+
+fn id_pair(p *entry) (*entry, bool) {
+    return move p, true
+}
+
+fn main() {
+    f := fn() {
+        m := map[string]entry{"a": entry{n: 1}}
+        p := &m["a"]
+        p2, ok := id_pair(p)
+        delete(m, "a")
+        p2.n = 9
+        fmt.println(ok)
+        fmt.println(p2.n)
+    }
+    f()
+}
+"#;
+    let r_a3 = check(a3_src);
+    assert_eq!(r_a3.verdict, Verdict::Reject, "{:?}", r_a3.diagnostics);
+    assert!(
+        error_codes(&r_a3).iter().any(|c| c == "HYB-E3102"),
+        "expected HYB-E3102 inside closure for unpacked slot loan, got: {:?}",
+        r_a3.diagnostics
+    );
+
+    let t24_src = r#"
+import "fmt"
+
+struct entry {
+    n int
+}
+
+fn id_pair(p *entry) (*entry, bool) {
+    return move p, true
+}
+
+fn main() {
+    f := fn() {
+        m := map[string]entry{"a": entry{n: 1}}
+        p := &m["a"]
+        p2, ok := id_pair(p)
+        q := &p2
+        fmt.println(ok)
+        fmt.println(q)
+    }
+    f()
+}
+"#;
+    let r_t24 = check(t24_src);
+    assert_eq!(r_t24.verdict, Verdict::Reject, "{:?}", r_t24.diagnostics);
+    assert!(
+        error_codes(&r_t24).iter().any(|c| c == "HYB-E3104"),
+        "expected HYB-E3104 inside closure for `&p2`, got: {:?}",
+        r_t24.diagnostics
+    );
+}

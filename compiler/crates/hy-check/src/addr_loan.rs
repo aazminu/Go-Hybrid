@@ -63,6 +63,7 @@ impl<'a> Checker<'a> {
         }
         let mut roots = Vec::new();
         crate::model::collect_ref_roots(val, &mut roots);
+        crate::loans::collect_move_ident_sources(val, &mut roots);
         roots.iter().any(|r| {
             let root = crate::freeze::resolve_alias(st, r);
             self.lookup_binding(st, r).is_some_and(|sb| sb.slot_loan)
