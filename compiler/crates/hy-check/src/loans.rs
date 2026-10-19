@@ -5556,15 +5556,18 @@ impl<'a> Checker<'a> {
                     }
 
                     if let Some(b) = st.env_lookup_mut(name) {
+                        let keep_existing_option_ty = matches!(info.shape, TypeShape::Unknown)
+                            && b.ty.as_ref().is_some_and(|t| self.ty_is_option(t));
                         if !matches!(info.shape, TypeShape::Unknown) || b.ty.is_none() {
                             b.shape = info.shape;
                         }
-                        if info.ty.is_some()
-                            || b.ty.is_none()
-                            || matches!(
-                                b.ty.as_ref().map(|t| self.resolve_type_alias(t)),
-                                Some(hy_syntax::TypeExpr::Fn { .. })
-                            )
+                        if !keep_existing_option_ty
+                            && (info.ty.is_some()
+                                || b.ty.is_none()
+                                || matches!(
+                                    b.ty.as_ref().map(|t| self.resolve_type_alias(t)),
+                                    Some(hy_syntax::TypeExpr::Fn { .. })
+                                ))
                         {
                             b.ty = info.ty;
                         }
@@ -5679,10 +5682,12 @@ impl<'a> Checker<'a> {
                         self.preserve_peers_before_sever(st, name, false);
                     }
                     if let Some(b) = st.env_lookup_mut(name) {
+                        let keep_existing_option_ty = matches!(shape, TypeShape::Unknown)
+                            && b.ty.as_ref().is_some_and(|t| self.ty_is_option(t));
                         if !matches!(shape, TypeShape::Unknown) || b.ty.is_none() {
                             b.shape = shape.clone();
                         }
-                        if ty.is_some() || b.ty.is_none() {
+                        if !keep_existing_option_ty && (ty.is_some() || b.ty.is_none()) {
                             b.ty = ty;
                         }
                         b.moved = None;

@@ -323,3 +323,112 @@ fn main() {
     );
 }
 
+#[test]
+fn option_from_chan_receive_select_and_range_preserves_option_wrapper() {
+    let r_recv = check(
+        r#"package main
+
+fn worker(p *option[chan int]) {
+    _ = p
+}
+
+fn bad_recv_local(ch chan option[chan int]) {
+    opt := <-ch
+    opt <- 1
+    x := <-opt
+    _ = x
+    task worker(&opt)
+    opt2, ok := <-ch
+    _ = ok
+    opt2 <- 2
+}
+"#,
+    );
+    assert_has(&r_recv, "HYB-E3007");
+    assert_has(&r_recv, "HYB-E2008");
+    assert_has(&r_recv, "HYB-E3001");
+
+    let r_select = check(
+        r#"package main
+
+fn worker(p *option[chan int]) {
+    _ = p
+}
+
+fn bad_select_recv(ch chan option[chan int]) {
+    select {
+        opt := <-ch: {
+            opt <- 1
+            x := <-opt
+            _ = x
+            task worker(&opt)
+        }
+        default: {}
+    }
+}
+"#,
+    );
+    assert_has(&r_select, "HYB-E3007");
+    assert_has(&r_select, "HYB-E2008");
+    assert_has(&r_select, "HYB-E3001");
+
+    let r_for = check(
+        r#"package main
+
+fn worker(p *option[chan int]) {
+    _ = p
+}
+
+fn bad_for_range(xs []option[chan int]) {
+    for _, opt in xs {
+        opt <- 1
+        x := <-opt
+        _ = x
+        task worker(&opt)
+    }
+}
+"#,
+    );
+    assert_has(&r_for, "HYB-E3007");
+    assert_has(&r_for, "HYB-E2008");
+    assert_has(&r_for, "HYB-E3001");
+}
+
+#[test]
+fn nested_option_reassigned_to_none_and_new_option_alias_rejected() {
+    let r_nested = check(
+        r#"package main
+
+fn bad_nested() {
+    var opt option[option[chan int]] = some(some(make(chan int, 1)))
+    opt = none
+    match opt {
+        some(inner): {
+            inner <- 1
+        }
+        none: {}
+    }
+}
+"#,
+    );
+    assert_has(&r_nested, "HYB-E3007");
+
+    let r_new_alias = check(
+        r#"package main
+import "sync/atomic"
+
+type opt_atomic = option[atomic.int64]
+
+fn worker(p *opt_atomic) {
+    _ = p
+}
+
+fn bad_new_alias() {
+    p := new(opt_atomic)
+    task worker(p)
+}
+"#,
+    );
+    assert_has(&r_new_alias, "HYB-E3001");
+}
+
