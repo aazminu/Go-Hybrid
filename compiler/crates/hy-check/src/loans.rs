@@ -409,6 +409,7 @@ impl<'a> Checker<'a> {
         } else {
             let mut roots = Vec::new();
             collect_ref_roots(&first.value, &mut roots);
+            collect_move_ident_sources(&first.value, &mut roots);
             for r in roots {
                 self.emit_a3_if_live(st, &r, cr.span, idx, verb);
             }
@@ -589,6 +590,7 @@ impl<'a> Checker<'a> {
         for (i, a) in cr.args.iter().enumerate() {
             let mut aroots = Vec::new();
             collect_ref_roots(&a.value, &mut aroots);
+            collect_move_ident_sources(&a.value, &mut aroots);
             let arg_path_opt = walk::expr_path(&a.value);
             for arg_path in arg_path_opt.into_iter().chain(aroots) {
                 if !live.iter().any(|p| a3_paths_conflict(st, p, &arg_path)) {
@@ -2032,6 +2034,7 @@ impl<'a> Checker<'a> {
         }
         let mut ref_roots = Vec::new();
         collect_ref_roots(inner, &mut ref_roots);
+        collect_move_ident_sources(inner, &mut ref_roots);
         ref_roots.iter().any(|r| {
             st.borrow_bindings.contains(r)
                 || st
@@ -2585,9 +2588,13 @@ impl<'a> Checker<'a> {
         if moved_srcs.is_empty() {
             return;
         }
+        let name_last = st.last_use.get(name).copied().unwrap_or(idx).max(idx);
         for src in moved_srcs {
             if src == name {
                 continue;
+            }
+            if st.borrow_bindings.contains(&src) {
+                st.borrow_bindings.insert(name.to_string());
             }
             let place = Place {
                 kind: PlaceKind::Ident(src.clone()),
@@ -2596,13 +2603,22 @@ impl<'a> Checker<'a> {
             if let Some(const_root) = self.const_write_root(st, &place) {
                 st.share_edge(name, &const_root);
             }
+            let resolved_src = crate::freeze::resolve_alias(st, &src);
+            for l in &mut st.loans {
+                if let LoanTarget::MapSlot { binding, .. } = &l.target {
+                    if (binding == &src || *binding == resolved_src)
+                        && (idx == 0 || l.created <= idx)
+                    {
+                        l.last = l.last.max(name_last);
+                    }
+                }
+            }
             let inherited: Vec<Loan> = st
                 .loans
                 .iter()
                 .filter_map(|l| match &l.target {
                     LoanTarget::MapSlot { binding, path, key }
-                        if l.created <= idx
-                            && idx <= l.last
+                        if (idx == 0 || (l.created <= idx && idx <= l.last))
                             && a3_paths_conflict(st, path, &src) =>
                     {
                         Some(Loan {
@@ -2613,6 +2629,22 @@ impl<'a> Checker<'a> {
                             },
                             created: l.created,
                             last: l.last,
+                            span: l.span,
+                            desc: l.desc.clone(),
+                        })
+                    }
+                    LoanTarget::MapSlot { binding, path, key }
+                        if (idx == 0 || l.created <= idx)
+                            && (binding == &src || *binding == resolved_src) =>
+                    {
+                        Some(Loan {
+                            target: LoanTarget::MapSlot {
+                                binding: name.to_string(),
+                                path: path.clone(),
+                                key: key.clone(),
+                            },
+                            created: l.created,
+                            last: l.last.max(name_last),
                             span: l.span,
                             desc: l.desc.clone(),
                         })
@@ -2651,8 +2683,10 @@ impl<'a> Checker<'a> {
         }
         let mut dst_roots = Vec::new();
         collect_ref_roots(&dst.value, &mut dst_roots);
+        collect_move_ident_sources(&dst.value, &mut dst_roots);
         let mut src_roots = Vec::new();
         collect_ref_roots(&src.value, &mut src_roots);
+        collect_move_ident_sources(&src.value, &mut src_roots);
         for d in &dst_roots {
             for s in &src_roots {
                 if d != s && self.binding_may_share(st, d) && self.binding_may_share(st, s) {
@@ -5141,8 +5175,10 @@ impl<'a> Checker<'a> {
         let mut roots = Vec::new();
         collect_ref_roots(subject, &mut roots);
         self.collect_callee_const_return_roots(st, subject, &mut roots, 0);
+        let mut all_roots = roots.clone();
+        collect_move_ident_sources(subject, &mut all_roots);
 
-        let pre_tainted = roots.iter().any(|r| {
+        let pre_tainted = all_roots.iter().any(|r| {
             self.lookup_binding(st, r)
                 .map(|b| b.managed_taint)
                 .unwrap_or(false)
@@ -5151,19 +5187,22 @@ impl<'a> Checker<'a> {
             self.lookup_binding(st, r).and_then(|b| b.moved.clone())
         });
         let pre_origin = if self.shape_may_share(&shape) {
-            roots.iter().find_map(|r| {
-                self.non_owned_origin_of(st, r).map(|(o, via_share)| {
-                    if via_share || (!shape.is_reference_alias() && r != name) {
-                        format!("a may-share peer of {}", o)
-                    } else {
-                        o
-                    }
+            all_roots
+                .iter()
+                .find_map(|r| {
+                    self.non_owned_origin_of(st, r).map(|(o, via_share)| {
+                        if via_share || (!shape.is_reference_alias() && r != name) {
+                            format!("a may-share peer of {}", o)
+                        } else {
+                            o
+                        }
+                    })
                 })
-            })
+                .or_else(|| self.moved_non_owned_origin_in_expr(st, subject))
         } else {
             None
         };
-        let pre_const_root = roots.iter().find_map(|r| {
+        let pre_const_root = all_roots.iter().find_map(|r| {
             let p = Place {
                 kind: PlaceKind::Ident(r.clone()),
                 span: subject.span(),
@@ -5191,6 +5230,7 @@ impl<'a> Checker<'a> {
             }
         }
 
+        let carries_borrow = self.expr_carries_borrow(st, subject);
         let self_shadows_const = pre_const_root.as_deref() == Some(name);
         self.define_binding(
             st,
@@ -5201,8 +5241,12 @@ impl<'a> Checker<'a> {
             managed || pre_tainted,
             false,
         );
+        if carries_borrow {
+            st.borrow_bindings.insert(name.to_string());
+        }
 
         self.record_may_share(st, name, subject);
+        self.record_move_const_and_a3_loans(st, name, subject, 0);
         self.record_alias(st, name, subject);
 
         for peer in &pre_share_peers {
@@ -5956,6 +6000,7 @@ impl<'a> Checker<'a> {
                             // shadows and clears alias/share state.
                             let mut roots = Vec::new();
                             collect_ref_roots(subject, &mut roots);
+                            collect_move_ident_sources(subject, &mut roots);
                             self.collect_callee_const_return_roots(&cst, subject, &mut roots, 0);
                             let croot = roots.iter().find_map(|r| {
                                 if self.lookup_binding(&cst, r).is_none() {
@@ -6184,6 +6229,7 @@ impl<'a> Checker<'a> {
                             if !is_chan {
                                 let mut roots = Vec::new();
                                 collect_ref_roots(expr, &mut roots);
+                                collect_move_ident_sources(expr, &mut roots);
                                 self.collect_callee_const_return_roots(&cst, expr, &mut roots, 0);
                                 for root in roots {
                                     if self.lookup_binding(&cst, &root).is_some() {

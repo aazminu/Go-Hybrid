@@ -448,3 +448,160 @@ fn main() {
     assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
     assert!(error_codes(&r).is_empty(), "{:?}", r.diagnostics);
 }
+
+// ---------------------------------------------------------------------------
+// 7. Issue #752 — move-wrapped expressions in match, for-in, return, copy,
+//    and map mutations preserve non-owned, const, borrow, and A3 provenance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn match_move_some_param_and_copy_move_param_are_e3004() {
+    let src = "\
+fn launder_match(param []int, ch chan []int) {
+    match move some(param) {
+        some(v) => {
+            ch <- move v
+        }
+        none => {}
+    }
+}
+
+fn launder_copy(src [][]int, ch chan [][]int) {
+    dst := make([][]int, 1)
+    copy(dst, move src)
+    ch <- move dst
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3004").count() >= 2,
+        "expected HYB-E3004 for both match move some(param) and copy(dst, move src), got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn match_move_const_and_for_in_move_const_are_e3006() {
+    let src = "\
+fn main() {
+    const xs = []int{1, 2, 3}
+    opt := some(xs)
+    match move opt {
+        some(v) => {
+            v[0] = 99
+        }
+        none => {}
+    }
+
+    const slices = [][]int{[]int{1, 2}}
+    for _, s in move slices {
+        s[0] = 88
+    }
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3006").count() >= 2,
+        "expected HYB-E3006 for both match move opt and for-in move slices, got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn return_move_wrapped_borrow_pointer_is_e3104() {
+    let src = "\
+fn escape_local() *int {
+    x := 42
+    p := &x
+    q := move p
+    return q
+}
+
+fn escape_direct() *int {
+    x := 42
+    p := &x
+    return move p
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3104").count() >= 2,
+        "expected HYB-E3104 for both q := move p; return q and return move p, got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn slot_loan_invalidated_by_move_wrapped_delete_call_and_alias_is_e3102() {
+    let src = "\
+import \"fmt\"
+
+fn mutate(x map[string]int) {
+    x[\"b\"] = 2
+}
+
+fn main() {
+    m := map[string]int{\"a\": 1}
+    p := &m[\"a\"]
+    delete(move m, \"a\")
+    fmt.println(p)
+
+    m2 := map[string]int{\"a\": 1}
+    p2 := &m2[\"a\"]
+    mutate(move m2)
+    fmt.println(p2)
+
+    m3 := map[string]int{\"a\": 1}
+    p3 := &m3[\"a\"]
+    m3_alias := move m3
+    m3_alias[\"b\"] = 3
+    fmt.println(p3)
+
+    m4 := map[string]int{\"a\": 1}
+    opt4 := some(m4)
+    p4 := &m4[\"a\"]
+    match move opt4 {
+        some(v) => {
+            v[\"b\"] = 4
+        }
+        none => {}
+    }
+    fmt.println(p4)
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+    let codes = error_codes(&r);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E3102").count() >= 4,
+        "expected HYB-E3102 for delete(move m), mutate(move m2), m3_alias insert, and match move opt4 insert, got {:?}",
+        r.diagnostics
+    );
+}
+
+#[test]
+fn owned_match_move_opt_send_is_accepted() {
+    let src = "\
+fn main() {
+    ch := make(chan map[string]int, 1)
+    m := map[string]int{\"k\": 1}
+    opt := some(m)
+    match move opt {
+        some(v) => {
+            ch <- move v
+        }
+        none => {}
+    }
+}
+";
+    let r = check(src);
+    assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    assert!(error_codes(&r).is_empty(), "{:?}", r.diagnostics);
+}
+
