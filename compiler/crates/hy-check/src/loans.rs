@@ -2067,7 +2067,9 @@ impl<'a> Checker<'a> {
         if let Some(ty) = &b.ty {
             let resolved = self.resolve_type_alias(ty);
             match &resolved {
-                hy_syntax::TypeExpr::Array { .. } => return true,
+                hy_syntax::TypeExpr::Array { .. } | hy_syntax::TypeExpr::Option { .. } => {
+                    return true
+                }
                 hy_syntax::TypeExpr::Named { name: tname, .. } => {
                     let base = Self::base_named_type_str(tname);
                     if self.structs.contains_key(base) {
@@ -5133,7 +5135,10 @@ impl<'a> Checker<'a> {
         managed: bool,
     ) {
         let shape = self.shape_of_expr(st, subject);
-        let ty = match self.ty_of_expr(st, subject) {
+        let ty = match self
+            .ty_of_expr(st, subject)
+            .map(|t| self.resolve_type_alias(&t))
+        {
             Some(hy_syntax::TypeExpr::Option { elem, .. }) => Some(*elem),
             other => other,
         };

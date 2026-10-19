@@ -196,3 +196,130 @@ fn drain(opt option[chan chan<- int]) {
     );
     assert_has(&r_select, "HYB-E3008");
 }
+
+#[test]
+fn addr_of_option_chan_or_atomic_across_task_and_chan_rejected() {
+    let r_task_chan = check(
+        r#"package main
+
+fn worker(p *option[chan int]) {
+    _ = p
+}
+
+fn main() {
+    ch := make(chan int, 1)
+    opt := some(ch)
+    task worker(&opt)
+}
+"#,
+    );
+    assert_has(&r_task_chan, "HYB-E3001");
+
+    let r_send_atomic = check(
+        r#"package main
+import "sync/atomic"
+
+fn main() {
+    var a atomic.int64
+    opt := some(a)
+    out := make(chan *option[atomic.int64], 1)
+    out <- &opt
+}
+"#,
+    );
+    assert_has(&r_send_atomic, "HYB-E3002");
+}
+
+#[test]
+fn pointer_to_option_atomic_in_struct_field_and_return_rejected() {
+    let r = check(
+        r#"package main
+import "sync/atomic"
+
+struct holder {
+    p *option[atomic.int64]
+}
+
+fn escape() *option[atomic.int64] {
+    var a atomic.int64
+    opt := some(a)
+    p := &opt
+    return p
+}
+"#,
+    );
+    assert_has(&r, "HYB-E3103");
+    assert_has(&r, "HYB-E3104");
+}
+
+#[test]
+fn send_recv_and_range_directly_on_option_rejected() {
+    let r_send = check(
+        r#"package main
+
+fn bad_send(opt option[chan int]) {
+    opt <- 1
+}
+"#,
+    );
+    assert_has(&r_send, "HYB-E3007");
+
+    let r_recv = check(
+        r#"package main
+
+fn bad_recv(opt option[chan int]) {
+    x := <-opt
+    _ = x
+}
+"#,
+    );
+    assert_has(&r_recv, "HYB-E2008");
+
+    let r_range = check(
+        r#"package main
+
+fn bad_range(opt_xs option[[]int], opt_arr option[[2]int]) {
+    for _, x in opt_xs {
+        _ = x
+    }
+    for _, y in &opt_arr {
+        _ = y
+    }
+}
+"#,
+    );
+    let codes = error_codes(&r_range);
+    assert!(
+        codes.iter().filter(|c| *c == "HYB-E2009").count() >= 2,
+        "expected HYB-E2009 for both opt_xs and &opt_arr, got {:?}",
+        r_range.diagnostics
+    );
+}
+
+#[test]
+fn option_chan_by_value_and_match_unwrapped_ops_accepted() {
+    assert_accepts(
+        r#"package main
+
+type opt_ch_t = option[chan int]
+
+fn worker(opt opt_ch_t) {
+    match opt {
+        some(ch): {
+            ch <- 1
+            v := <-ch
+            _ = v
+        }
+        none: {}
+    }
+}
+
+fn main() {
+    ch := make(chan int, 1)
+    var opt opt_ch_t = some(ch)
+    task worker(opt)
+}
+"#,
+    );
+}
+

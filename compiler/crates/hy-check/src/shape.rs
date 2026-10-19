@@ -32,7 +32,11 @@ impl<'a> Checker<'a> {
         match ty {
             TypeExpr::Named { name, .. } => self.named_shape_depth(name, depth),
             TypeExpr::Pointer { to, .. } => {
-                TypeShape::Pointer(Box::new(self.shape_of_type_depth(to, depth + 1)))
+                if self.ty_is_option(to) {
+                    TypeShape::Pointer(Box::new(TypeShape::Struct(None)))
+                } else {
+                    TypeShape::Pointer(Box::new(self.shape_of_type_depth(to, depth + 1)))
+                }
             }
             TypeExpr::Slice { elem, .. } => {
                 TypeShape::Slice(Box::new(self.shape_of_type_depth(elem, depth + 1)))
@@ -229,12 +233,20 @@ impl<'a> Checker<'a> {
             }
             Expr::Unary { op, operand, .. } => match op {
                 hy_syntax::UnOp::Addr => {
-                    TypeShape::Pointer(Box::new(self.shape_of_expr(st, operand)))
+                    if self.expr_is_option(st, operand) {
+                        TypeShape::Pointer(Box::new(TypeShape::Struct(None)))
+                    } else {
+                        TypeShape::Pointer(Box::new(self.shape_of_expr(st, operand)))
+                    }
                 }
                 _ => TypeShape::Primitive,
             },
             Expr::AddrOf { operand, .. } => {
-                TypeShape::Pointer(Box::new(self.shape_of_expr(st, operand)))
+                if self.expr_is_option(st, operand) {
+                    TypeShape::Pointer(Box::new(TypeShape::Struct(None)))
+                } else {
+                    TypeShape::Pointer(Box::new(self.shape_of_expr(st, operand)))
+                }
             }
             Expr::Move { operand, .. }
             | Expr::Try { operand, .. }
@@ -577,6 +589,31 @@ impl<'a> Checker<'a> {
             break;
         }
         cur
+    }
+
+    pub(crate) fn ty_is_option(&self, ty: &TypeExpr) -> bool {
+        matches!(self.resolve_type_alias(ty), TypeExpr::Option { .. })
+    }
+
+    pub(crate) fn expr_is_option(&self, st: &FnState, expr: &Expr) -> bool {
+        if let Some(ty) = self.ty_of_expr(st, expr) {
+            if self.ty_is_option(&ty) {
+                return true;
+            }
+        }
+        match crate::model::unwrap_parens(expr) {
+            Expr::Move { operand, .. } | Expr::Try { operand, .. } => {
+                self.expr_is_option(st, operand)
+            }
+            Expr::Receive { chan, .. } => self
+                .ty_of_expr(st, chan)
+                .map(|ct| match self.resolve_type_alias(&ct) {
+                    TypeExpr::Chan { elem, .. } => self.ty_is_option(&elem),
+                    _ => false,
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
     }
 
     /// The as-written type of an initializer, when directly available
