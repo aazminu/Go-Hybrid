@@ -5306,6 +5306,7 @@ fn collect_comparable_in_expr<'a>(
             entries,
             ..
         } => {
+            collect_map_key_type_params(key, param_names, out);
             collect_comparable_type_params(key, param_names, out);
             collect_comparable_type_params(value, param_names, out);
             for (k, v) in entries {
@@ -5680,6 +5681,8 @@ fn main() {
             "struct box[t] { v t }\nfn bad_struct_key[t any](x t) {\n    m := map[box[t]]int{}\n    fmt.println(m, x)\n}\nfn main() { bad_struct_key(1) }\n",
             // 13. `task` statement calling a `comparable` generic fn with a slice
             "fn same[t comparable](a t, b t) {\n    if a == b { fmt.println(1) }\n}\nfn main() {\n    xs := []int{1}\n    managed {\n        task same(xs, xs)\n    }\n}\n",
+            // 14. Body `Expr::MapLit` infers `comparable` constraint and rejects slice argument
+            "fn map_get[k](x k) int {\n    m := map[k]int{x: 1}\n    return m[x]\n}\nfn main() {\n    xs := []int{1}\n    fmt.println(map_get(xs))\n}\n",
         ] {
             let r = check(src);
             assert_eq!(r.verdict, Verdict::Reject, "expected reject for:\n{src}");
@@ -5716,6 +5719,11 @@ fn wrap[t](x t) box[t] {
     return box[t]{ v: x }
 }
 
+fn map_get[k](x k) int {
+    m := map[k]int{x: 1}
+    return m[x]
+}
+
 fn same[t comparable](a t, b t) bool {
     return a == b
 }
@@ -5730,7 +5738,7 @@ fn main() {
     c.order = []string{\"a\"}
     var b box[int]
     b = wrap(42)
-    fmt.println(c.has(\"a\"), same(1, 2), forward_same(\"x\", \"x\"), b.v)
+    fmt.println(c.has(\"a\"), same(1, 2), forward_same(\"x\", \"x\"), b.v, map_get(\"a\"))
 }
 ";
         let r = check(src);
